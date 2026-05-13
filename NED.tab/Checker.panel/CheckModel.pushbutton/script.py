@@ -776,7 +776,13 @@ class ModelSelectionDialog(Form):
 # =============================================
 # STEP 5 — EXCEL EXPORT
 # =============================================
-def export_to_excel(results, export_folder, gap_mm):
+def _link_code(link_name):
+    """Возвращает код дисциплины из позиции [2] имени файла."""
+    parts = link_name.replace('.rvt', '').replace('.RVT', '').split('-')
+    return parts[2] if len(parts) >= 3 else link_name.split('.')[0]
+
+
+def export_to_excel(results, export_folder, gap_mm, selected_structural, selected_mep):
     """Экспортирует результаты в xlsx файл по формату ТЗ (через xlsxwriter)."""
     try:
         import xlsxwriter
@@ -790,7 +796,12 @@ def export_to_excel(results, export_folder, gap_mm):
             return None, 'Cannot create folder: {}'.format(e)
 
     now = datetime.datetime.now()
-    filename = 'NED_OpeningCheck_{}.xlsx'.format(now.strftime('%Y-%m-%d_%H-%M'))
+
+    struct_tag = '+'.join(_link_code(l['name']) for l in selected_structural)
+    mep_tag    = '+'.join(_link_code(l['name']) for l in selected_mep)
+    filename = 'NED_OpeningCheck_{}_{}_{}.xlsx'.format(
+        now.strftime('%Y-%m-%d_%H-%M'), struct_tag, mep_tag
+    )
     filepath = os.path.join(export_folder, filename)
 
     try:
@@ -957,7 +968,10 @@ def main():
 
     output.print_md('---')
     output.print_md('**Saving Excel report...**')
-    filepath, err = export_to_excel(results, export_folder, dlg.gap_mm)
+    filepath, err = export_to_excel(
+        results, export_folder, dlg.gap_mm,
+        dlg.selected_structural, dlg.selected_mep
+    )
 
     if err:
         output.print_md('**Export error:** {}'.format(err))
