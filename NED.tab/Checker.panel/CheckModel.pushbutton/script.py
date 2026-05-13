@@ -778,9 +778,46 @@ def print_results(results, output, gap_mm):
 VIEW_NAME = 'NED_OpeningChecker_View'
 
 
-def navigate_to_result(result, selected_structural, selected_mep):
-    """Создаёт/обновляет 3D вид с Section Box вокруг выбранного пересечения.
+def _get_solid_fill_pattern_id():
+    """Возвращает ElementId solid fill паттерна из документа."""
+    for fp in DB.FilteredElementCollector(doc).OfClass(DB.FillPatternElement).ToElements():
+        try:
+            if fp.GetFillPattern().IsSolidFill:
+                return fp.Id
+        except Exception:
+            pass
+    return None
 
+
+def _make_override(r, g, b, transparency, solid_id):
+    """Создаёт OverrideGraphicSettings с заданным цветом и прозрачностью."""
+    ogs = DB.OverrideGraphicSettings()
+    color = DB.Color(r, g, b)
+    if solid_id:
+        try:
+            ogs.SetSurfaceForegroundPatternId(solid_id)
+            ogs.SetSurfaceForegroundPatternColor(color)
+            ogs.SetCutForegroundPatternId(solid_id)
+            ogs.SetCutForegroundPatternColor(color)
+        except Exception:
+            pass
+    try:
+        ogs.SetSurfaceTransparency(transparency)
+    except Exception:
+        pass
+    try:
+        ogs.SetProjectionLineColor(color)
+        ogs.SetCutLineColor(color)
+    except Exception:
+        pass
+    return ogs
+
+
+def navigate_to_result(result, selected_structural, selected_mep):
+    """Создаёт/обновляет 3D вид с Section Box и графическими overrides.
+
+    MEP линки — маджента, непрозрачные.
+    Structural линки — серые, 65% прозрачности.
     Возвращает ElementId вида или None при ошибке.
     """
     bboxes = []
@@ -831,6 +868,13 @@ def navigate_to_result(result, selected_structural, selected_mep):
     section_box.Min = DB.XYZ(min_x, min_y, min_z)
     section_box.Max = DB.XYZ(max_x, max_y, max_z)
 
+    solid_id = _get_solid_fill_pattern_id()
+
+    # MEP: маджента (255, 0, 210), непрозрачно
+    mep_ogs    = _make_override(255, 0, 210, 0,  solid_id)
+    # Structural: серый (150, 150, 150), 65% прозрачности
+    struct_ogs = _make_override(150, 150, 150, 65, solid_id)
+
     try:
         with revit.Transaction('NED: Update opening view'):
             view = None
@@ -851,6 +895,19 @@ def navigate_to_result(result, selected_structural, selected_mep):
 
             if view:
                 view.SetSectionBox(section_box)
+
+                # Применяем overrides к RevitLinkInstance (весь линк как один элемент)
+                for m_link in selected_mep:
+                    try:
+                        view.SetElementOverrides(m_link['instance'].Id, mep_ogs)
+                    except Exception:
+                        pass
+                for s_link in selected_structural:
+                    try:
+                        view.SetElementOverrides(s_link['instance'].Id, struct_ogs)
+                    except Exception:
+                        pass
+
                 return view.Id
     except Exception:
         pass
