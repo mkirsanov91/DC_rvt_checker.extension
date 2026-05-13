@@ -9,10 +9,12 @@ import datetime
 clr.AddReference('System.Windows.Forms')
 clr.AddReference('System.Drawing')
 
+import time as _time
+
 from System.Windows.Forms import (
     Form, Label, CheckBox, TextBox, Button,
     FlowLayoutPanel, GroupBox, Panel, RadioButton,
-    ComboBox, ComboBoxStyle,
+    ComboBox, ComboBoxStyle, Application,
     DataGridView, DataGridViewTextBoxColumn,
     DataGridViewSelectionMode, DataGridViewAutoSizeColumnsMode,
     DataGridViewColumnHeadersHeightSizeMode, DataGridViewColumnSortMode,
@@ -1610,11 +1612,15 @@ def main():
         except Exception:
             pass
 
-    # Шаг 4: навигатор результатов
+    # Шаг 4: навигатор результатов (modeless — Revit остаётся активным)
     output.print_md('---')
     output.print_md('*Opening Results Navigator...*')
     nav = ResultsNavigatorForm(results, dlg.selected_structural, dlg.selected_mep)
-    nav.ShowDialog()
+    nav.TopMost = True   # навигатор поверх окна Revit
+    nav.Show()
+    while nav.Visible:
+        Application.DoEvents()   # Revit обрабатывает свои события в паузах
+        _time.sleep(0.05)
 
     # После закрытия навигатора — переключаемся на 3D вид если был создан
     if nav.target_view_id is not None:
