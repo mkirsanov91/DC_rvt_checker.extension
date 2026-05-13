@@ -11,8 +11,12 @@ clr.AddReference('System.Drawing')
 
 from System.Windows.Forms import (
     Form, Label, CheckBox, TextBox, Button,
-    FlowLayoutPanel, GroupBox,
-    FormBorderStyle, DialogResult,
+    FlowLayoutPanel, GroupBox, Panel, RadioButton,
+    ComboBox, ComboBoxStyle,
+    DataGridView, DataGridViewTextBoxColumn,
+    DataGridViewSelectionMode, DataGridViewAutoSizeColumnsMode,
+    DataGridViewColumnHeadersHeightSizeMode, DataGridViewColumnSortMode,
+    FormBorderStyle, DialogResult, DockStyle, BorderStyle,
     FlowDirection, AnchorStyles,
     FolderBrowserDialog, MessageBox, MessageBoxButtons,
     MessageBoxIcon, FormStartPosition,
@@ -767,6 +771,367 @@ def print_results(results, output, gap_mm):
 
 
 # =============================================
+# STEP 4 — NAVIGATE TO ELEMENT IN 3D VIEW
+# =============================================
+VIEW_NAME = 'NED_OpeningChecker_View'
+
+
+def navigate_to_result(result, selected_structural, selected_mep):
+    """Создаёт/обновляет 3D вид с Section Box вокруг выбранного пересечения.
+
+    Возвращает ElementId вида или None при ошибке.
+    """
+    bboxes = []
+
+    # BBox MEP элемента
+    if result['mep_id'] != 0:
+        for m_link in selected_mep:
+            link_doc = m_link['instance'].GetLinkDocument()
+            if link_doc is None:
+                continue
+            try:
+                elem = link_doc.GetElement(DB.ElementId(result['mep_id']))
+                if elem is not None:
+                    bb = elem.get_BoundingBox(None)
+                    if bb:
+                        bboxes.append(transform_bbox(bb, m_link['instance'].GetTotalTransform()))
+                    break
+            except Exception:
+                pass
+
+    # BBox конструктивного элемента
+    for s_link in selected_structural:
+        link_doc = s_link['instance'].GetLinkDocument()
+        if link_doc is None:
+            continue
+        try:
+            elem = link_doc.GetElement(DB.ElementId(result['struct_id']))
+            if elem is not None:
+                bb = elem.get_BoundingBox(None)
+                if bb:
+                    bboxes.append(transform_bbox(bb, s_link['instance'].GetTotalTransform()))
+                break
+        except Exception:
+            pass
+
+    if not bboxes:
+        return None
+
+    offset_ft = 1000.0 / FT_TO_MM
+    min_x = min(b.Min.X for b in bboxes) - offset_ft
+    min_y = min(b.Min.Y for b in bboxes) - offset_ft
+    min_z = min(b.Min.Z for b in bboxes) - offset_ft
+    max_x = max(b.Max.X for b in bboxes) + offset_ft
+    max_y = max(b.Max.Y for b in bboxes) + offset_ft
+    max_z = max(b.Max.Z for b in bboxes) + offset_ft
+
+    section_box = DB.BoundingBoxXYZ()
+    section_box.Min = DB.XYZ(min_x, min_y, min_z)
+    section_box.Max = DB.XYZ(max_x, max_y, max_z)
+
+    try:
+        with revit.Transaction('NED: Update opening view'):
+            view = None
+            for v in DB.FilteredElementCollector(doc).OfClass(DB.View3D).ToElements():
+                if not v.IsTemplate and v.Name == VIEW_NAME:
+                    view = v
+                    break
+
+            if view is None:
+                vft = None
+                for vt in DB.FilteredElementCollector(doc).OfClass(DB.ViewFamilyType).ToElements():
+                    if vt.ViewFamily == DB.ViewFamily.ThreeDimensional:
+                        vft = vt
+                        break
+                if vft:
+                    view = DB.View3D.CreateIsometric(doc, vft.Id)
+                    view.Name = VIEW_NAME
+
+            if view:
+                view.SetSectionBox(section_box)
+                return view.Id
+    except Exception:
+        pass
+
+    return None
+
+
+# =============================================
+# STEP 4 — RESULTS NAVIGATOR FORM
+# =============================================
+_STATUS_COLORS = {
+    STATUS_NO_OPENING: (Color.FromArgb(255, 80, 80),  Color.White),
+    STATUS_OK:         (Color.FromArgb(120, 195, 60), Color.Black),
+    STATUS_UNDERSIZED: (Color.FromArgb(255, 140, 0),  Color.White),
+    STATUS_EMPTY:      (Color.FromArgb(255, 230, 0),  Color.Black),
+}
+
+
+class ResultsNavigatorForm(Form):
+
+    def __init__(self, results, selected_structural, selected_mep):
+        Form.__init__(self)
+        self.all_results = results
+        self.selected_structural = selected_structural
+        self.selected_mep = selected_mep
+        self.filtered = list(results)
+        self.target_view_id = None
+        self._init_ui()
+        self._rebuild_grid()
+
+    # ------------------------------------------------------------------
+    # UI build
+    # ------------------------------------------------------------------
+    def _init_ui(self):
+        self.Text = 'NED DC — Opening Checker: Results'
+        self.Size = Size(1300, 720)
+        self.MinimumSize = Size(1000, 500)
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.Font = Font('Segoe UI', 9)
+        self.BackColor = Color.White
+
+        # ---- Top toolbar ----
+        toolbar = Panel()
+        toolbar.Dock = DockStyle.Top
+        toolbar.Height = 86
+        toolbar.BackColor = Color.FromArgb(245, 247, 250)
+        self.Controls.Add(toolbar)
+
+        x = 10
+        def lbl(text, tx, ty):
+            l = Label(); l.Text = text; l.Location = Point(tx, ty); l.AutoSize = True
+            toolbar.Controls.Add(l)
+
+        # Status filter
+        lbl('Status:', x, 13)
+        self._cmb_status = ComboBox()
+        self._cmb_status.Location = Point(x + 50, 9)
+        self._cmb_status.Width = 130
+        self._cmb_status.DropDownStyle = ComboBoxStyle.DropDownList
+        for v in ['All', STATUS_NO_OPENING, STATUS_OK, STATUS_UNDERSIZED, STATUS_EMPTY]:
+            self._cmb_status.Items.Add(v)
+        self._cmb_status.SelectedIndex = 0
+        self._cmb_status.SelectedIndexChanged += self._on_filter
+        toolbar.Controls.Add(self._cmb_status)
+
+        # System filter
+        x2 = x + 195
+        lbl('System:', x2, 13)
+        systems = ['All'] + sorted(set(r['mep_system'] for r in self.all_results if r['mep_system'] != '-'))
+        self._cmb_system = ComboBox()
+        self._cmb_system.Location = Point(x2 + 55, 9)
+        self._cmb_system.Width = 210
+        self._cmb_system.DropDownStyle = ComboBoxStyle.DropDownList
+        for s in systems:
+            self._cmb_system.Items.Add(s)
+        self._cmb_system.SelectedIndex = 0
+        self._cmb_system.SelectedIndexChanged += self._on_filter
+        toolbar.Controls.Add(self._cmb_system)
+
+        # Level filter
+        x3 = x2 + 280
+        lbl('Level:', x3, 13)
+        levels = ['All'] + sorted(set(r['level'] for r in self.all_results))
+        self._cmb_level = ComboBox()
+        self._cmb_level.Location = Point(x3 + 47, 9)
+        self._cmb_level.Width = 160
+        self._cmb_level.DropDownStyle = ComboBoxStyle.DropDownList
+        for lv in levels:
+            self._cmb_level.Items.Add(lv)
+        self._cmb_level.SelectedIndex = 0
+        self._cmb_level.SelectedIndexChanged += self._on_filter
+        toolbar.Controls.Add(self._cmb_level)
+
+        # Concrete only
+        x4 = x3 + 225
+        self._chk_concrete = CheckBox()
+        self._chk_concrete.Text = 'Concrete only'
+        self._chk_concrete.Location = Point(x4, 11)
+        self._chk_concrete.AutoSize = True
+        self._chk_concrete.CheckedChanged += self._on_filter
+        toolbar.Controls.Add(self._chk_concrete)
+
+        # Group-by row
+        lbl('Group by:', x, 48)
+        self._rb_sys = RadioButton()
+        self._rb_sys.Text = 'System → Level'
+        self._rb_sys.Location = Point(x + 68, 45)
+        self._rb_sys.AutoSize = True
+        self._rb_sys.Checked = True
+        self._rb_sys.CheckedChanged += self._on_filter
+        toolbar.Controls.Add(self._rb_sys)
+
+        self._rb_lvl = RadioButton()
+        self._rb_lvl.Text = 'Level → System'
+        self._rb_lvl.Location = Point(x + 195, 45)
+        self._rb_lvl.AutoSize = True
+        self._rb_lvl.CheckedChanged += self._on_filter
+        toolbar.Controls.Add(self._rb_lvl)
+
+        # Status bar label
+        self._lbl_count = Label()
+        self._lbl_count.Location = Point(x + 330, 48)
+        self._lbl_count.AutoSize = True
+        self._lbl_count.ForeColor = Color.FromArgb(90, 90, 90)
+        toolbar.Controls.Add(self._lbl_count)
+
+        # Navigate hint label
+        self._lbl_nav = Label()
+        self._lbl_nav.Location = Point(x + 330, 10)
+        self._lbl_nav.AutoSize = True
+        self._lbl_nav.ForeColor = Color.FromArgb(30, 90, 160)
+        self._lbl_nav.Font = Font('Segoe UI', 9, FontStyle.Bold)
+        toolbar.Controls.Add(self._lbl_nav)
+
+        # ---- DataGridView ----
+        self._grid = DataGridView()
+        self._grid.Dock = DockStyle.Fill
+        self._grid.ReadOnly = True
+        self._grid.AllowUserToAddRows = False
+        self._grid.AllowUserToDeleteRows = False
+        self._grid.MultiSelect = False
+        self._grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
+        self._grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None
+        self._grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing
+        self._grid.ColumnHeadersHeight = 30
+        self._grid.RowTemplate.Height = 22
+        self._grid.BackgroundColor = Color.White
+        self._grid.GridColor = Color.FromArgb(215, 215, 215)
+        self._grid.BorderStyle = BorderStyle.None
+        self._grid.Font = Font('Segoe UI', 8.5)
+        self._grid.RowHeadersVisible = False
+        self._grid.CellFormatting += self._on_cell_format
+        self._grid.CellDoubleClick += self._on_dbl_click
+        self.Controls.Add(self._grid)
+
+        col_defs = [
+            ('Status',        110),
+            ('Level',         110),
+            ('MEP System',    240),
+            ('MEP Type',      130),
+            ('Struct Type',    90),
+            ('Concrete',       75),
+            ('Thickness mm',   100),
+            ('Opening Size',   115),
+            ('Elevation mm',    95),
+            ('MEP ID',          80),
+            ('Struct ID',       80),
+        ]
+        for name, width in col_defs:
+            col = DataGridViewTextBoxColumn()
+            col.HeaderText = name
+            col.Name = name
+            col.Width = width
+            col.SortMode = DataGridViewColumnSortMode.Automatic
+            self._grid.Columns.Add(col)
+
+    # ------------------------------------------------------------------
+    # Filter & rebuild
+    # ------------------------------------------------------------------
+    def _on_filter(self, _s, _a):
+        self._rebuild_grid()
+
+    def _rebuild_grid(self):
+        status_f  = self._cmb_status.SelectedItem  if self._cmb_status.SelectedItem  else 'All'
+        system_f  = self._cmb_system.SelectedItem  if self._cmb_system.SelectedItem  else 'All'
+        level_f   = self._cmb_level.SelectedItem   if self._cmb_level.SelectedItem   else 'All'
+        concrete  = self._chk_concrete.Checked
+
+        data = self.all_results
+        if status_f != 'All':
+            data = [r for r in data if r['status'] == status_f]
+        if system_f != 'All':
+            data = [r for r in data if r['mep_system'] == system_f]
+        if level_f != 'All':
+            data = [r for r in data if r['level'] == level_f]
+        if concrete:
+            data = [r for r in data if r['is_concrete']]
+
+        if self._rb_sys.Checked:
+            data = sorted(data, key=lambda r: (r['mep_system'], r['level'], r['status']))
+        else:
+            data = sorted(data, key=lambda r: (r['level'], r['mep_system'], r['status']))
+
+        self.filtered = data
+
+        self._grid.SuspendLayout()
+        self._grid.Rows.Clear()
+        for r in data:
+            thickness = '{} mm'.format(int(r['thickness_mm'])) if r['thickness_mm'] > 0 else '-'
+            elev      = '{} mm'.format(r['elevation_mm']) if r['elevation_mm'] != 0 else '-'
+            mep_id    = str(r['mep_id']) if r['mep_id'] != 0 else '-'
+            self._grid.Rows.Add([
+                r['status'],
+                r['level'],
+                r['mep_system'],
+                r['mep_type'],
+                r['struct_type'],
+                'Yes' if r['is_concrete'] else 'No',
+                thickness,
+                r['opening_size'],
+                elev,
+                mep_id,
+                str(r['struct_id']),
+            ])
+        self._grid.ResumeLayout()
+
+        totals = {s: sum(1 for r in self.all_results if r['status'] == s)
+                  for s in [STATUS_NO_OPENING, STATUS_OK, STATUS_UNDERSIZED, STATUS_EMPTY]}
+        self._lbl_count.Text = (
+            'Showing {} / {}  |  No Opening: {}  OK: {}  Undersized: {}  Empty: {}'.format(
+                len(data), len(self.all_results),
+                totals[STATUS_NO_OPENING], totals[STATUS_OK],
+                totals[STATUS_UNDERSIZED], totals[STATUS_EMPTY]
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Cell coloring
+    # ------------------------------------------------------------------
+    def _on_cell_format(self, _s, e):
+        if e.RowIndex < 0 or e.RowIndex >= len(self.filtered):
+            return
+        r = self.filtered[e.RowIndex]
+
+        # Status column
+        if e.ColumnIndex == 0:
+            colors = _STATUS_COLORS.get(r['status'])
+            if colors:
+                e.CellStyle.BackColor = colors[0]
+                e.CellStyle.ForeColor = colors[1]
+
+        # Thickness column
+        if e.ColumnIndex == 6 and r['thickness_mm'] > 0:
+            t = r['thickness_mm']
+            if t >= 400:
+                e.CellStyle.BackColor = Color.FromArgb(220, 50, 50)
+                e.CellStyle.ForeColor = Color.White
+            elif t >= 200:
+                e.CellStyle.BackColor = Color.FromArgb(255, 140, 0)
+                e.CellStyle.ForeColor = Color.White
+            else:
+                e.CellStyle.BackColor = Color.FromArgb(255, 230, 0)
+                e.CellStyle.ForeColor = Color.Black
+
+    # ------------------------------------------------------------------
+    # Double-click → navigate
+    # ------------------------------------------------------------------
+    def _on_dbl_click(self, _s, e):
+        if e.RowIndex < 0 or e.RowIndex >= len(self.filtered):
+            return
+        r = self.filtered[e.RowIndex]
+        try:
+            vid = navigate_to_result(r, self.selected_structural, self.selected_mep)
+            if vid is not None:
+                self.target_view_id = vid
+                self._lbl_nav.Text = u'✓ {} updated — close window to switch to it'.format(VIEW_NAME)
+            else:
+                self._lbl_nav.Text = 'Could not locate elements.'
+        except Exception as ex:
+            self._lbl_nav.Text = 'Error: {}'.format(ex)
+
+
+# =============================================
 # PYREVIT CONFIG HELPERS
 # =============================================
 def get_saved_export_path():
@@ -1242,10 +1607,24 @@ def main():
         output.print_md('**Export error:** {}'.format(err))
     else:
         output.print_md('**Report saved:** `{}`'.format(filepath))
-        # Открываем файл автоматически
         try:
             import System.Diagnostics
             System.Diagnostics.Process.Start(filepath)
+        except Exception:
+            pass
+
+    # Шаг 4: навигатор результатов
+    output.print_md('---')
+    output.print_md('*Opening Results Navigator...*')
+    nav = ResultsNavigatorForm(results, dlg.selected_structural, dlg.selected_mep)
+    nav.ShowDialog()
+
+    # После закрытия навигатора — переключаемся на 3D вид если был создан
+    if nav.target_view_id is not None:
+        try:
+            view = doc.GetElement(nav.target_view_id)
+            if view:
+                revit.uidoc.ActiveView = view
         except Exception:
             pass
 
