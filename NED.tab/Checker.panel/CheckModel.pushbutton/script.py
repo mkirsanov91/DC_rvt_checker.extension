@@ -264,6 +264,57 @@ def get_cat_name(elem):
 # =============================================
 # DATA COLLECTION FROM LINKED DOCUMENTS
 # =============================================
+def diagnose_wall_types(selected_structural, output):
+    """Выводит уникальные имена типов стен и материалов из конструктивных линков."""
+    output.print_md('## Wall type diagnostics')
+    for s_link in selected_structural:
+        inst = s_link['instance']
+        link_doc = inst.GetLinkDocument()
+        if link_doc is None:
+            continue
+        output.print_md('### {}'.format(s_link['name']))
+
+        type_names   = set()
+        mat_names    = set()
+
+        walls = DB.FilteredElementCollector(link_doc)\
+            .OfClass(DB.Wall)\
+            .WhereElementIsNotElementType()\
+            .ToElements()
+
+        for wall in walls:
+            try:
+                wt = getattr(wall, 'WallType', None)
+                if wt is None:
+                    tid = wall.GetTypeId()
+                    if tid and tid.IntegerValue != -1:
+                        wt = link_doc.GetElement(tid)
+                if wt is not None:
+                    type_names.add(wt.Name or '(empty)')
+                    # Слои материалов
+                    get_cs = getattr(wt, 'GetCompoundStructure', None)
+                    if get_cs:
+                        cs = get_cs()
+                        if cs:
+                            for layer in cs.GetLayers():
+                                if layer.MaterialId != DB.ElementId.InvalidElementId:
+                                    mat = link_doc.GetElement(layer.MaterialId)
+                                    if mat:
+                                        mat_names.add(mat.Name or '(empty)')
+            except Exception:
+                continue
+
+        output.print_md('**Wall types ({} unique):**'.format(len(type_names)))
+        for n in sorted(type_names):
+            output.print_md('- `{}`'.format(n))
+
+        output.print_md('**Materials in layers ({} unique):**'.format(len(mat_names)))
+        for n in sorted(mat_names):
+            output.print_md('- `{}`'.format(n))
+
+    output.print_md('---')
+
+
 def get_mep_elements(link_doc):
     """Получает все MEP кривые (трубы, воздуховоды, лотки, кондуиты) из линка."""
     try:
@@ -959,6 +1010,9 @@ def main():
         ', '.join(l['name'] for l in dlg.selected_mep)))
     output.print_md('**Clearance:** {} mm'.format(dlg.gap_mm))
     output.print_md('---')
+
+    # Диагностика типов стен (временно — поможет настроить ключевые слова бетона)
+    diagnose_wall_types(dlg.selected_structural, output)
 
     # Шаг 2: проверка пересечений
     results = run_check(dlg.selected_structural, dlg.selected_mep, dlg.gap_mm, output)
