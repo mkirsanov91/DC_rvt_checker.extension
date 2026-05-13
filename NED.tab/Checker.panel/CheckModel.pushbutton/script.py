@@ -870,10 +870,20 @@ def navigate_to_result(result, selected_structural, selected_mep):
 
     solid_id = _get_solid_fill_pattern_id()
 
-    # MEP: маджента (255, 0, 210), непрозрачно
-    mep_ogs    = _make_override(255, 0, 210, 0,  solid_id)
-    # Structural: серый (150, 150, 150), 65% прозрачности
+    # Весь MEP линк: маджента непрозрачно (фон)
+    mep_ogs    = _make_override(255, 0, 210,  0,  solid_id)
+    # Конкретный MEP элемент: ярко-жёлтый с толстым контуром (highlight)
+    hi_ogs     = _make_override(255, 230,  0,  0,  solid_id)
+    # Structural: серый, 65% прозрачности
     struct_ogs = _make_override(150, 150, 150, 65, solid_id)
+    try:
+        hi_ogs.SetProjectionLineWeight(7)
+        hi_ogs.SetCutLineWeight(7)
+    except Exception:
+        pass
+
+    target_view_id = None
+    mep_link_inst  = None   # запомним для выделения после транзакции
 
     try:
         with revit.Transaction('NED: Update opening view'):
@@ -896,7 +906,7 @@ def navigate_to_result(result, selected_structural, selected_mep):
             if view:
                 view.SetSectionBox(section_box)
 
-                # Применяем overrides к RevitLinkInstance (весь линк как один элемент)
+                # Overrides на уровне всего линка
                 for m_link in selected_mep:
                     try:
                         view.SetElementOverrides(m_link['instance'].Id, mep_ogs)
@@ -908,11 +918,39 @@ def navigate_to_result(result, selected_structural, selected_mep):
                     except Exception:
                         pass
 
-                return view.Id
+                # Highlight конкретного MEP элемента внутри линка
+                if result['mep_id'] != 0:
+                    for m_link in selected_mep:
+                        lnk_doc = m_link['instance'].GetLinkDocument()
+                        if lnk_doc is None:
+                            continue
+                        try:
+                            el = lnk_doc.GetElement(DB.ElementId(result['mep_id']))
+                            if el is not None:
+                                # Revit 2024+ API: per-element override внутри линка
+                                view.SetLinkElementOverrides(
+                                    m_link['instance'].Id, el.Id, hi_ogs
+                                )
+                                mep_link_inst = m_link['instance']
+                        except Exception:
+                            mep_link_inst = m_link['instance']
+                        break
+
+                target_view_id = view.Id
     except Exception:
         pass
 
-    return None
+    # После транзакции — выделяем RevitLinkInstance MEP модели (даёт синий highlight)
+    if mep_link_inst is not None:
+        try:
+            from System.Collections.Generic import List as CList
+            ids = CList[DB.ElementId]()
+            ids.Add(mep_link_inst.Id)
+            revit.uidoc.Selection.SetElementIds(ids)
+        except Exception:
+            pass
+
+    return target_view_id
 
 
 # =============================================
