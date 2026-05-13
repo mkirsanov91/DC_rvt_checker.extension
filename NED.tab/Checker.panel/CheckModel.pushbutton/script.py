@@ -813,13 +813,16 @@ def _make_override(r, g, b, transparency, solid_id):
     return ogs
 
 
-def navigate_to_result(result, selected_structural, selected_mep):
+def navigate_to_result(result, selected_structural, selected_mep, host_doc=None, host_uidoc=None):
     """Создаёт/обновляет 3D вид с Section Box и графическими overrides.
 
     MEP линки — маджента, непрозрачные.
     Structural линки — серые, 65% прозрачности.
     Возвращает ElementId вида или None при ошибке.
+    Принимает host_doc/host_uidoc чтобы работать после завершения pyRevit скрипта.
     """
+    _doc   = host_doc   or doc
+    _uidoc = host_uidoc or revit.uidoc
     bboxes = []
 
     # BBox MEP элемента
@@ -883,70 +886,84 @@ def navigate_to_result(result, selected_structural, selected_mep):
         pass
 
     target_view_id = None
-    mep_link_inst  = None   # запомним для выделения после транзакции
+    mep_link_inst  = None
 
+    # Используем DB.Transaction напрямую — работает и внутри и вне pyRevit скрипта
+    t = DB.Transaction(_doc, 'NED: Update opening view')
     try:
-        with revit.Transaction('NED: Update opening view'):
-            view = None
-            for v in DB.FilteredElementCollector(doc).OfClass(DB.View3D).ToElements():
-                if not v.IsTemplate and v.Name == VIEW_NAME:
-                    view = v
+        t.Start()
+
+        view = None
+        for v in DB.FilteredElementCollector(_doc).OfClass(DB.View3D).ToElements():
+            if not v.IsTemplate and v.Name == VIEW_NAME:
+                view = v
+                break
+
+        if view is None:
+            vft = None
+            for vt in DB.FilteredElementCollector(_doc).OfClass(DB.ViewFamilyType).ToElements():
+                if vt.ViewFamily == DB.ViewFamily.ThreeDimensional:
+                    vft = vt
+                    break
+            if vft:
+                view = DB.View3D.CreateIsometric(_doc, vft.Id)
+                view.Name = VIEW_NAME
+
+        if view:
+            view.SetSectionBox(section_box)
+
+            for m_link in selected_mep:
+                try:
+                    view.SetElementOverrides(m_link['instance'].Id, mep_ogs)
+                except Exception:
+                    pass
+            for s_link in selected_structural:
+                try:
+                    view.SetElementOverrides(s_link['instance'].Id, struct_ogs)
+                except Exception:
+                    pass
+
+            if result['mep_id'] != 0:
+                for m_link in selected_mep:
+                    lnk_doc = m_link['instance'].GetLinkDocument()
+                    if lnk_doc is None:
+                        continue
+                    try:
+                        el = lnk_doc.GetElement(DB.ElementId(result['mep_id']))
+                        if el is not None:
+                            view.SetLinkElementOverrides(
+                                m_link['instance'].Id, el.Id, hi_ogs
+                            )
+                            mep_link_inst = m_link['instance']
+                    except Exception:
+                        mep_link_inst = m_link['instance']
                     break
 
-            if view is None:
-                vft = None
-                for vt in DB.FilteredElementCollector(doc).OfClass(DB.ViewFamilyType).ToElements():
-                    if vt.ViewFamily == DB.ViewFamily.ThreeDimensional:
-                        vft = vt
-                        break
-                if vft:
-                    view = DB.View3D.CreateIsometric(doc, vft.Id)
-                    view.Name = VIEW_NAME
+            target_view_id = view.Id
 
-            if view:
-                view.SetSectionBox(section_box)
-
-                # Overrides на уровне всего линка
-                for m_link in selected_mep:
-                    try:
-                        view.SetElementOverrides(m_link['instance'].Id, mep_ogs)
-                    except Exception:
-                        pass
-                for s_link in selected_structural:
-                    try:
-                        view.SetElementOverrides(s_link['instance'].Id, struct_ogs)
-                    except Exception:
-                        pass
-
-                # Highlight конкретного MEP элемента внутри линка
-                if result['mep_id'] != 0:
-                    for m_link in selected_mep:
-                        lnk_doc = m_link['instance'].GetLinkDocument()
-                        if lnk_doc is None:
-                            continue
-                        try:
-                            el = lnk_doc.GetElement(DB.ElementId(result['mep_id']))
-                            if el is not None:
-                                # Revit 2024+ API: per-element override внутри линка
-                                view.SetLinkElementOverrides(
-                                    m_link['instance'].Id, el.Id, hi_ogs
-                                )
-                                mep_link_inst = m_link['instance']
-                        except Exception:
-                            mep_link_inst = m_link['instance']
-                        break
-
-                target_view_id = view.Id
+        t.Commit()
     except Exception:
-        pass
+        try:
+            t.RollBack()
+        except Exception:
+            pass
 
-    # После транзакции — выделяем RevitLinkInstance MEP модели (даёт синий highlight)
+    # Выделяем MEP линк instance
     if mep_link_inst is not None:
         try:
             from System.Collections.Generic import List as CList
             ids = CList[DB.ElementId]()
             ids.Add(mep_link_inst.Id)
-            revit.uidoc.Selection.SetElementIds(ids)
+            _uidoc.Selection.SetElementIds(ids)
+        except Exception:
+            pass
+
+    # Переключаемся на 3D вид
+    if target_view_id is not None:
+        try:
+            view_obj = _doc.GetElement(target_view_id)
+            if view_obj:
+                _uidoc.ActiveView = view_obj
         except Exception:
             pass
 
@@ -973,6 +990,9 @@ class ResultsNavigatorForm(Form):
         self.selected_mep = selected_mep
         self.filtered = list(results)
         self.target_view_id = None
+        # Сохраняем ссылки на doc/uidoc — они нужны после завершения скрипта
+        self._doc   = doc
+        self._uidoc = revit.uidoc
         self._init_ui()
         self._rebuild_grid()
 
@@ -1219,10 +1239,13 @@ class ResultsNavigatorForm(Form):
             return
         r = self.filtered[e.RowIndex]
         try:
-            vid = navigate_to_result(r, self.selected_structural, self.selected_mep)
+            vid = navigate_to_result(
+                r, self.selected_structural, self.selected_mep,
+                self._doc, self._uidoc
+            )
             if vid is not None:
                 self.target_view_id = vid
-                self._lbl_nav.Text = u'✓ {} updated — close window to switch to it'.format(VIEW_NAME)
+                self._lbl_nav.Text = u'✓ Navigated to element (MEP ID: {})'.format(r['mep_id'])
             else:
                 self._lbl_nav.Text = 'Could not locate elements.'
         except Exception as ex:
@@ -1711,24 +1734,14 @@ def main():
         except Exception:
             pass
 
-    # Шаг 4: навигатор результатов (modeless — Revit остаётся активным)
+    # Шаг 4: навигатор результатов
+    # Show() — немодальное окно, скрипт завершается, Revit полностью активен.
+    # Навигация по двойному клику работает через DB.Transaction на UI потоке Revit.
     output.print_md('---')
     output.print_md('*Opening Results Navigator...*')
     nav = ResultsNavigatorForm(results, dlg.selected_structural, dlg.selected_mep)
-    nav.TopMost = True   # навигатор поверх окна Revit
+    nav.TopMost = True
     nav.Show()
-    while nav.Visible:
-        Application.DoEvents()   # Revit обрабатывает свои события в паузах
-        _time.sleep(0.05)
-
-    # После закрытия навигатора — переключаемся на 3D вид если был создан
-    if nav.target_view_id is not None:
-        try:
-            view = doc.GetElement(nav.target_view_id)
-            if view:
-                revit.uidoc.ActiveView = view
-        except Exception:
-            pass
 
 
 main()
