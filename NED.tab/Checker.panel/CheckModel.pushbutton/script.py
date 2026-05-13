@@ -17,80 +17,517 @@ from System.Windows.Forms import (
     MessageBoxIcon, FormStartPosition,
     ScrollBars
 )
-from System.Drawing import (
-    Point, Size, Font, FontStyle, Color
-)
+from System.Drawing import Point, Size, Font, FontStyle, Color
 
 from pyrevit import revit, DB, script, forms
 
 doc = revit.doc
+
+# =============================================
+# CONSTANTS
+# =============================================
+FT_TO_MM = 304.8
+
+# Ключевые слова для определения бетона: иврит, английский, русский
+CONCRETE_KW = [
+    u'בטון',   # בטון (иврит)
+    u'Concrete', u'concrete', u'CONCRETE',
+    u'бетон', u'Бетон',
+]
 
 # Коды дисциплин на позиции [2] в имени файла: S-HA-[КОД]-[КОМПАНИЯ]-[ЛОКАЦИЯ]-RVT2X
 STRUCTURAL_FILE_CODES = ['AR', 'S', 'ST', 'O', 'OP']
 MEP_FILE_CODES        = ['H', 'P', 'E', 'F', 'T', 'HV', 'PL', 'EL', 'FL']
 SKIP_FILE_CODES       = ['TR', 'SI', 'CO', 'CR', 'G', 'Z', 'B', 'FU', 'ID']
 
+STATUS_NO_OPENING = 'No Opening'
+STATUS_OK         = 'Opening OK'
+STATUS_UNDERSIZED = 'Undersized'
+STATUS_EMPTY      = 'Empty'
 
+
+# =============================================
+# LINK CLASSIFICATION
+# =============================================
 def classify_link(link_name):
-    """Определяет тип модели по имени файла Revit Link.
-
-    Формат: S-HA-[КОД]-[КОМПАНИЯ]-[ЛОКАЦИЯ]-RVT2X
-    Дисциплинарный код — позиция [2] при разбивке по дефису.
-    """
-    name_clean = link_name.replace('.rvt', '').replace('.RVT', '')
-    parts = name_clean.split('-')
-
-    # Основной путь: берём код с позиции [2]
+    """Определяет тип модели по коду дисциплины на позиции [2] имени файла."""
+    parts = link_name.replace('.rvt', '').replace('.RVT', '').split('-')
     if len(parts) >= 3:
-        discipline = parts[2].upper()
-        if discipline in [c.upper() for c in SKIP_FILE_CODES]:
-            return 'skip'
-        if discipline in [c.upper() for c in STRUCTURAL_FILE_CODES]:
-            return 'structural'
-        if discipline in [c.upper() for c in MEP_FILE_CODES]:
-            return 'mep'
-
-    # Запасной путь для нестандартных имён: сканируем все позиции
+        d = parts[2].upper()
+        if d in [c.upper() for c in SKIP_FILE_CODES]:       return 'skip'
+        if d in [c.upper() for c in STRUCTURAL_FILE_CODES]: return 'structural'
+        if d in [c.upper() for c in MEP_FILE_CODES]:        return 'mep'
+    # Запасной путь для нестандартных имён
     for part in parts:
-        if part.upper() in [c.upper() for c in SKIP_FILE_CODES]:
-            return 'skip'
+        if part.upper() in [c.upper() for c in SKIP_FILE_CODES]:       return 'skip'
     for part in parts:
-        if part.upper() in [c.upper() for c in MEP_FILE_CODES]:
-            return 'mep'
+        if part.upper() in [c.upper() for c in MEP_FILE_CODES]:        return 'mep'
     for part in parts:
-        if part.upper() in [c.upper() for c in STRUCTURAL_FILE_CODES]:
-            return 'structural'
-
+        if part.upper() in [c.upper() for c in STRUCTURAL_FILE_CODES]: return 'structural'
     return 'unknown'
 
 
 def get_all_revit_links():
     """Получает все подключённые Revit Links из текущего документа."""
-    collector = DB.FilteredElementCollector(doc)\
-        .OfClass(DB.RevitLinkInstance)\
-        .ToElements()
-
+    collector = DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance).ToElements()
     links = []
-    for link_instance in collector:
-        link_type = doc.GetElement(link_instance.GetTypeId())
-        if link_type is None:
+    for inst in collector:
+        ltype = doc.GetElement(inst.GetTypeId())
+        if ltype is None:
             continue
-        link_name = link_type.get_Parameter(
-            DB.BuiltInParameter.ALL_MODEL_TYPE_NAME
-        ).AsString()
-        if not link_name:
-            link_name = link_instance.Name
-
-        category = classify_link(link_name)
-        links.append({
-            'name': link_name,
-            'instance': link_instance,
-            'category': category
-        })
-
+        name = ltype.get_Parameter(DB.BuiltInParameter.ALL_MODEL_TYPE_NAME).AsString()
+        if not name:
+            name = inst.Name
+        links.append({'name': name, 'instance': inst, 'category': classify_link(name)})
     return links
 
 
+# =============================================
+# UTILITY — GEOMETRY
+# =============================================
+def ft_to_mm(ft):
+    return ft * FT_TO_MM
+
+
+def transform_bbox(bbox, transform):
+    """Трансформирует BoundingBox из координат линка в координаты хоста."""
+    corners = [
+        DB.XYZ(x, y, z)
+        for x in [bbox.Min.X, bbox.Max.X]
+        for y in [bbox.Min.Y, bbox.Max.Y]
+        for z in [bbox.Min.Z, bbox.Max.Z]
+    ]
+    pts = [transform.OfPoint(c) for c in corners]
+    result = DB.BoundingBoxXYZ()
+    result.Min = DB.XYZ(min(p.X for p in pts), min(p.Y for p in pts), min(p.Z for p in pts))
+    result.Max = DB.XYZ(max(p.X for p in pts), max(p.Y for p in pts), max(p.Z for p in pts))
+    return result
+
+
+def bboxes_intersect(b1, b2):
+    return (b1.Min.X <= b2.Max.X and b1.Max.X >= b2.Min.X and
+            b1.Min.Y <= b2.Max.Y and b1.Max.Y >= b2.Min.Y and
+            b1.Min.Z <= b2.Max.Z and b1.Max.Z >= b2.Min.Z)
+
+
+# =============================================
+# UTILITY — ELEMENT PROPERTIES
+# =============================================
+def get_level_name(elem, link_doc):
+    try:
+        lid = elem.LevelId
+        if lid and lid != DB.ElementId.InvalidElementId:
+            lv = link_doc.GetElement(lid)
+            if lv:
+                return lv.Name
+    except Exception:
+        pass
+    return 'Unknown'
+
+
+def get_type_name(elem, link_doc):
+    try:
+        t = link_doc.GetElement(elem.GetTypeId())
+        if t:
+            return t.Name or 'Unknown'
+    except Exception:
+        pass
+    return 'Unknown'
+
+
+def is_concrete(elem, link_doc):
+    """Определяет бетонный ли элемент по ключевым словам в типе и материалах."""
+    try:
+        t = link_doc.GetElement(elem.GetTypeId())
+        if t is None:
+            return False
+        type_name = t.Name or ''
+        if any(kw in type_name for kw in CONCRETE_KW):
+            return True
+        # Проверяем слои составной структуры
+        get_cs = getattr(t, 'GetCompoundStructure', None)
+        if get_cs:
+            cs = get_cs()
+            if cs:
+                for layer in cs.GetLayers():
+                    if layer.MaterialId != DB.ElementId.InvalidElementId:
+                        mat = link_doc.GetElement(layer.MaterialId)
+                        if mat and any(kw in (mat.Name or '') for kw in CONCRETE_KW):
+                            return True
+    except Exception:
+        pass
+    return False
+
+
+def get_thickness_mm(elem, elem_type, link_doc):
+    """Возвращает толщину стены или перекрытия в мм."""
+    try:
+        if elem_type == 'Wall':
+            return ft_to_mm(elem.Width)
+        else:  # Floor
+            t = link_doc.GetElement(elem.GetTypeId())
+            if t:
+                get_cs = getattr(t, 'GetCompoundStructure', None)
+                if get_cs:
+                    cs = get_cs()
+                    if cs:
+                        return ft_to_mm(cs.GetWidth())
+            p = elem.get_Parameter(DB.BuiltInParameter.FLOOR_ATTR_THICKNESS_PARAM)
+            if p:
+                return ft_to_mm(p.AsDouble())
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_mep_size_mm(elem):
+    """Возвращает (ширина_мм, высота_мм) MEP элемента."""
+    try:
+        # Труба
+        p = elem.get_Parameter(DB.BuiltInParameter.RBS_PIPE_OUTER_DIAMETER)
+        if p and p.AsDouble() > 0:
+            d = ft_to_mm(p.AsDouble())
+            return d, d
+        # Кондуит
+        p = elem.get_Parameter(DB.BuiltInParameter.RBS_CONDUIT_OUTER_DIAM_PARAM)
+        if p and p.AsDouble() > 0:
+            d = ft_to_mm(p.AsDouble())
+            return d, d
+        # Прямоугольный воздуховод / кабельный лоток
+        pw = elem.get_Parameter(DB.BuiltInParameter.RBS_CURVE_WIDTH_PARAM)
+        ph = elem.get_Parameter(DB.BuiltInParameter.RBS_CURVE_HEIGHT_PARAM)
+        if pw and ph and pw.AsDouble() > 0:
+            return ft_to_mm(pw.AsDouble()), ft_to_mm(ph.AsDouble())
+        # Круглый воздуховод
+        p = elem.get_Parameter(DB.BuiltInParameter.RBS_CURVE_DIAMETER_PARAM)
+        if p and p.AsDouble() > 0:
+            d = ft_to_mm(p.AsDouble())
+            return d, d
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
+def get_opening_dims_mm(o_bbox):
+    """Возвращает (ширина_мм, высота_мм) отверстия из его BoundingBox.
+
+    Ширина — наибольшее из горизонтальных измерений,
+    высота — вертикальное (ось Z).
+    """
+    dx = ft_to_mm(o_bbox.Max.X - o_bbox.Min.X)
+    dy = ft_to_mm(o_bbox.Max.Y - o_bbox.Min.Y)
+    dz = ft_to_mm(o_bbox.Max.Z - o_bbox.Min.Z)
+    width  = max(dx, dy)   # горизонтальная сторона (зависит от ориентации стены)
+    height = dz             # вертикаль всегда по Z
+    return width, height
+
+
+def get_elev_from_level_mm(mep_bbox, struct_elem, struct_doc):
+    """Высота низа MEP элемента от уровня конструктивного элемента (мм)."""
+    try:
+        lid = struct_elem.LevelId
+        if lid and lid != DB.ElementId.InvalidElementId:
+            lv = struct_doc.GetElement(lid)
+            if lv:
+                return ft_to_mm(mep_bbox.Min.Z - lv.Elevation)
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_cat_name(elem):
+    try:
+        return elem.Category.Name
+    except Exception:
+        return 'MEP'
+
+
+# =============================================
+# DATA COLLECTION FROM LINKED DOCUMENTS
+# =============================================
+def get_mep_elements(link_doc):
+    """Получает все MEP кривые (трубы, воздуховоды, лотки, кондуиты) из линка."""
+    try:
+        return list(
+            DB.FilteredElementCollector(link_doc)
+            .OfClass(DB.MEPCurve)
+            .WhereElementIsNotElementType()
+            .ToElements()
+        )
+    except Exception:
+        return []
+
+
+def get_struct_elements(link_doc):
+    """Получает стены и перекрытия из линка."""
+    results = []
+    try:
+        for w in DB.FilteredElementCollector(link_doc).OfClass(DB.Wall).WhereElementIsNotElementType().ToElements():
+            results.append((w, 'Wall'))
+    except Exception:
+        pass
+    try:
+        for f in DB.FilteredElementCollector(link_doc).OfClass(DB.Floor).WhereElementIsNotElementType().ToElements():
+            results.append((f, 'Floor'))
+    except Exception:
+        pass
+    return results
+
+
+def get_openings(link_doc):
+    """Получает все Opening элементы из линка."""
+    try:
+        return list(
+            DB.FilteredElementCollector(link_doc)
+            .OfClass(DB.Opening)
+            .WhereElementIsNotElementType()
+            .ToElements()
+        )
+    except Exception:
+        return []
+
+
+# =============================================
+# STEP 2 — INTERSECTION CHECK
+# =============================================
+def run_check(selected_structural, selected_mep, gap_mm, output):
+    """Находит пересечения MEP элементов с конструктивом и определяет статус отверстий."""
+    results = []
+
+    # --- Загрузка конструктивных элементов ---
+    output.print_md('**Loading structural elements...**')
+    struct_index  = []   # список dict с данными каждого конструктивного элемента
+    openings_host = []   # [(opening, bbox_in_host, struct_doc)] для всех линков
+
+    for s_link in selected_structural:
+        inst = s_link['instance']
+        link_doc = inst.GetLinkDocument()
+        if link_doc is None:
+            output.print_md('- {} — *not loaded, skipped*'.format(s_link['name']))
+            continue
+
+        transform = inst.GetTotalTransform()
+        struct_elems = get_struct_elements(link_doc)
+        openings = get_openings(link_doc)
+
+        count = 0
+        for elem, etype in struct_elems:
+            try:
+                raw_bb = elem.get_BoundingBox(None)
+                if raw_bb is None:
+                    continue
+                struct_index.append({
+                    'elem':         elem,
+                    'etype':        etype,
+                    'bb':           transform_bbox(raw_bb, transform),
+                    'link_doc':     link_doc,
+                    'transform':    transform,
+                    'link_name':    s_link['name'],
+                    'thickness_mm': get_thickness_mm(elem, etype, link_doc),
+                    'is_concrete':  is_concrete(elem, link_doc),
+                    'level':        get_level_name(elem, link_doc),
+                    'type_name':    get_type_name(elem, link_doc),
+                    'openings':     openings,
+                })
+                count += 1
+            except Exception:
+                continue
+
+        for op in openings:
+            try:
+                ob = op.get_BoundingBox(None)
+                if ob:
+                    openings_host.append((op, transform_bbox(ob, transform), link_doc))
+            except Exception:
+                continue
+
+        output.print_md('- {} — {} walls/floors'.format(s_link['name'], count))
+
+    # Быстрый поиск конструктивного элемента по ID
+    struct_by_id = {se['elem'].Id.IntegerValue: se for se in struct_index}
+
+    # --- Проверка MEP элементов ---
+    output.print_md('**Checking MEP elements...**')
+    used_opening_ids = set()   # ID отверстий через которые прошёл MEP
+
+    for m_link in selected_mep:
+        inst = m_link['instance']
+        link_doc = inst.GetLinkDocument()
+        if link_doc is None:
+            output.print_md('- {} — *not loaded, skipped*'.format(m_link['name']))
+            continue
+
+        transform = inst.GetTotalTransform()
+        mep_elems = get_mep_elements(link_doc)
+        output.print_md('- {} — {} MEP curves'.format(m_link['name'], len(mep_elems)))
+
+        for mep in mep_elems:
+            try:
+                raw_bb = mep.get_BoundingBox(None)
+                if raw_bb is None:
+                    continue
+                mep_bb   = transform_bbox(raw_bb, transform)
+                mep_w, mep_h = get_mep_size_mm(mep)
+                cat_name = get_cat_name(mep)
+            except Exception:
+                continue
+
+            for se in struct_index:
+                if not bboxes_intersect(mep_bb, se['bb']):
+                    continue
+
+                # Пересечение найдено — ищем отверстие
+                found_op    = None
+                found_ob    = None
+
+                for op, ob_host, _doc in openings_host:
+                    if not bboxes_intersect(mep_bb, ob_host):
+                        continue
+                    # Отверстие должно принадлежать данному конструктивному элементу
+                    try:
+                        host = op.Host
+                        if host and host.Id != se['elem'].Id:
+                            continue
+                    except Exception:
+                        pass
+                    found_op = op
+                    found_ob = ob_host
+                    used_opening_ids.add(op.Id.IntegerValue)
+                    break
+
+                if found_op is None:
+                    status       = STATUS_NO_OPENING
+                    opening_size = '-'
+                else:
+                    o_w, o_h = get_opening_dims_mm(found_ob)
+                    opening_size = '{}x{} mm'.format(int(round(o_w)), int(round(o_h)))
+                    if o_w >= mep_w + gap_mm * 2 and o_h >= mep_h + gap_mm * 2:
+                        status = STATUS_OK
+                    else:
+                        status = STATUS_UNDERSIZED
+
+                results.append({
+                    'status':       status,
+                    'level':        se['level'],
+                    'mep_system':   m_link['name'],
+                    'mep_type':     cat_name,
+                    'mep_id':       mep.Id.IntegerValue,
+                    'mep_w_mm':     mep_w,
+                    'mep_h_mm':     mep_h,
+                    'struct_type':  se['etype'],
+                    'is_concrete':  se['is_concrete'],
+                    'type_name':    se['type_name'],
+                    'thickness_mm': se['thickness_mm'],
+                    'opening_size': opening_size,
+                    'elevation_mm': int(round(get_elev_from_level_mm(mep_bb, se['elem'], se['link_doc']))),
+                    'struct_id':    se['elem'].Id.IntegerValue,
+                })
+
+    # --- Пустые отверстия: открытия без MEP ---
+    for op, ob_host, op_doc in openings_host:
+        if op.Id.IntegerValue in used_opening_ids:
+            continue
+        try:
+            host = op.Host
+            if host is None:
+                continue
+            se = struct_by_id.get(host.Id.IntegerValue)
+            if se is None:
+                continue
+            o_w, o_h = get_opening_dims_mm(ob_host)
+            results.append({
+                'status':       STATUS_EMPTY,
+                'level':        se['level'],
+                'mep_system':   '-',
+                'mep_type':     '-',
+                'mep_id':       0,
+                'mep_w_mm':     0,
+                'mep_h_mm':     0,
+                'struct_type':  se['etype'],
+                'is_concrete':  se['is_concrete'],
+                'type_name':    se['type_name'],
+                'thickness_mm': se['thickness_mm'],
+                'opening_size': '{}x{} mm'.format(int(round(o_w)), int(round(o_h))),
+                'elevation_mm': 0,
+                'struct_id':    host.Id.IntegerValue,
+            })
+        except Exception:
+            continue
+
+    return results
+
+
+def print_results(results, output, gap_mm):
+    """Выводит итоги проверки в окно Output."""
+    counts = {STATUS_NO_OPENING: 0, STATUS_OK: 0, STATUS_UNDERSIZED: 0, STATUS_EMPTY: 0}
+    for r in results:
+        if r['status'] in counts:
+            counts[r['status']] += 1
+
+    output.print_md('## Summary')
+    output.print_md('Total intersections found: **{}**'.format(len(results)))
+    output.print_md('- No Opening: **{}**'.format(counts[STATUS_NO_OPENING]))
+    output.print_md('- Opening OK: **{}**'.format(counts[STATUS_OK]))
+    output.print_md('- Undersized: **{}**'.format(counts[STATUS_UNDERSIZED]))
+    output.print_md('- Empty (no MEP): **{}**'.format(counts[STATUS_EMPTY]))
+
+    critical = [r for r in results
+                if r['is_concrete'] and r['thickness_mm'] >= 400
+                and r['status'] not in (STATUS_OK, STATUS_EMPTY)]
+    if critical:
+        output.print_md('**Critical (concrete >= 400 mm, no valid opening): {}**'.format(len(critical)))
+
+    if not results:
+        output.print_md('*No intersections found.*')
+        return
+
+    output.print_md('## Results table')
+
+    # Статусные иконки
+    status_icon = {
+        STATUS_NO_OPENING: '[NO OPENING]',
+        STATUS_OK:         '[OK]',
+        STATUS_UNDERSIZED: '[UNDERSIZED]',
+        STATUS_EMPTY:      '[EMPTY]',
+    }
+
+    table_data = []
+    for r in results:
+        mep_size = '{}x{} mm'.format(int(r['mep_w_mm']), int(r['mep_h_mm'])) if r['mep_w_mm'] > 0 else '-'
+        thickness = '{} mm'.format(int(r['thickness_mm'])) if r['thickness_mm'] > 0 else '-'
+        elev = '{} mm'.format(r['elevation_mm']) if r['elevation_mm'] != 0 else '-'
+        mep_id_str   = str(r['mep_id'])   if r['mep_id']   != 0 else '-'
+        struct_id_str = str(r['struct_id'])
+
+        table_data.append([
+            status_icon.get(r['status'], r['status']),
+            r['level'],
+            r['mep_system'],
+            r['mep_type'],
+            mep_size,
+            r['struct_type'],
+            'Yes' if r['is_concrete'] else 'No',
+            thickness,
+            r['opening_size'],
+            elev,
+            mep_id_str,
+            struct_id_str,
+        ])
+
+    output.print_table(
+        table_data,
+        title='Opening Check Results (clearance = {} mm)'.format(gap_mm),
+        columns=[
+            'Status', 'Level', 'MEP Model', 'MEP Type', 'MEP Size',
+            'Struct', 'Concrete', 'Thickness',
+            'Opening Size', 'Elevation', 'MEP ID', 'Struct ID'
+        ]
+    )
+
+
+# =============================================
+# PYREVIT CONFIG HELPERS
+# =============================================
 def get_saved_export_path():
     try:
         cfg = script.get_config()
@@ -108,6 +545,9 @@ def save_export_path(path):
         pass
 
 
+# =============================================
+# STEP 1 — MODEL SELECTION DIALOG
+# =============================================
 class ModelSelectionDialog(Form):
 
     def __init__(self, structural_links, mep_links, unknown_links):
@@ -115,12 +555,10 @@ class ModelSelectionDialog(Form):
         self.structural_links = structural_links
         self.mep_links = mep_links
         self.unknown_links = unknown_links
-
         self.selected_structural = []
         self.selected_mep = []
         self.gap_mm = 50
         self.export_path = get_saved_export_path()
-
         self._init_ui()
 
     def _make_checkbox(self, text, parent):
@@ -160,7 +598,6 @@ class ModelSelectionDialog(Form):
 
         y = 68
 
-        # --- Structural models ---
         grp_struct = GroupBox()
         grp_struct.Text = 'Structural models (AR / ST / Openings)'
         grp_struct.Font = Font('Segoe UI', 9, FontStyle.Bold)
@@ -194,7 +631,6 @@ class ModelSelectionDialog(Form):
 
         y += 170
 
-        # --- MEP models ---
         grp_mep = GroupBox()
         grp_mep.Text = 'MEP models (HVAC / Plumbing / Electrical / Fuel)'
         grp_mep.Font = Font('Segoe UI', 9, FontStyle.Bold)
@@ -227,7 +663,6 @@ class ModelSelectionDialog(Form):
 
         y += 170
 
-        # --- Settings ---
         grp_settings = GroupBox()
         grp_settings.Text = 'Check settings'
         grp_settings.Font = Font('Segoe UI', 9, FontStyle.Bold)
@@ -305,36 +740,24 @@ class ModelSelectionDialog(Form):
             self._txt_path.Text = dlg.SelectedPath
 
     def _on_run(self, _s, _a):
-        self.selected_structural = [
-            cb.Tag for cb in self._struct_checkboxes if cb.Checked
-        ]
-        self.selected_mep = [
-            cb.Tag for cb in self._mep_checkboxes if cb.Checked
-        ]
+        self.selected_structural = [cb.Tag for cb in self._struct_checkboxes if cb.Checked]
+        self.selected_mep        = [cb.Tag for cb in self._mep_checkboxes if cb.Checked]
 
         if not self.selected_structural:
-            MessageBox.Show(
-                'Please select at least one structural model.',
-                'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning
-            )
+            MessageBox.Show('Please select at least one structural model.',
+                            'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning)
             return
-
         if not self.selected_mep:
-            MessageBox.Show(
-                'Please select at least one MEP model.',
-                'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning
-            )
+            MessageBox.Show('Please select at least one MEP model.',
+                            'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning)
             return
-
         try:
             self.gap_mm = int(self._txt_gap.Text.strip())
             if self.gap_mm < 0:
                 raise ValueError
         except ValueError:
-            MessageBox.Show(
-                'Please enter a valid clearance value (integer >= 0).',
-                'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning
-            )
+            MessageBox.Show('Please enter a valid clearance value (integer >= 0).',
+                            'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning)
             return
 
         self.export_path = self._txt_path.Text.strip()
@@ -349,9 +772,11 @@ class ModelSelectionDialog(Form):
         self.Close()
 
 
+# =============================================
+# ENTRY POINT
+# =============================================
 def main():
     all_links = get_all_revit_links()
-
     if not all_links:
         forms.alert(
             'No Revit Links found in the current document.\n'
@@ -370,18 +795,18 @@ def main():
 
     output = script.get_output()
     output.print_md('# NED DC — Opening Checker')
-    output.print_md('## Selected models')
-    output.print_md('### Structural:')
-    for link in dlg.selected_structural:
-        output.print_md('- {}'.format(link['name']))
-    output.print_md('### MEP:')
-    for link in dlg.selected_mep:
-        output.print_md('- {}'.format(link['name']))
+    output.print_md('**Structural:** {}'.format(
+        ', '.join(l['name'] for l in dlg.selected_structural)))
+    output.print_md('**MEP:** {}'.format(
+        ', '.join(l['name'] for l in dlg.selected_mep)))
     output.print_md('**Clearance:** {} mm'.format(dlg.gap_mm))
-    if dlg.export_path:
-        output.print_md('**Report folder:** {}'.format(dlg.export_path))
     output.print_md('---')
-    output.print_md('_Step 1 complete. Intersection logic will be implemented next._')
+
+    # Шаг 2: проверка пересечений
+    results = run_check(dlg.selected_structural, dlg.selected_mep, dlg.gap_mm, output)
+
+    output.print_md('---')
+    print_results(results, output, dlg.gap_mm)
 
 
 main()
