@@ -1075,8 +1075,9 @@ class ResultsNavigatorForm(Form):
             ])
         self._grid.ResumeLayout()
 
-        totals = {s: sum(1 for r in self.all_results if r['status'] == s)
-                  for s in [STATUS_NO_OPENING, STATUS_OK, STATUS_UNDERSIZED, STATUS_EMPTY]}
+        totals = {}
+        for _st in [STATUS_NO_OPENING, STATUS_OK, STATUS_UNDERSIZED, STATUS_EMPTY]:
+            totals[_st] = len([r for r in self.all_results if r['status'] == _st])
         self._lbl_count.Text = (
             'Showing {} / {}  |  No Opening: {}  OK: {}  Undersized: {}  Empty: {}'.format(
                 len(data), len(self.all_results),
