@@ -317,16 +317,42 @@ def get_struct_elements(link_doc):
 
 
 def get_openings(link_doc):
-    """Получает все Opening элементы из линка."""
+    """Получает элементы-отверстия из линка.
+
+    Собирает три типа:
+    - DB.Opening — стандартные вырезы Revit (Wall Opening, Floor Opening)
+    - DB.DirectShape — IFC-импортированные элементы
+    - Generic Model family instances — семейства-маркеры отверстий
+    """
+    results = []
+    # Стандартные вырезы Revit
     try:
-        return list(
-            DB.FilteredElementCollector(link_doc)
-            .OfClass(DB.Opening)
-            .WhereElementIsNotElementType()
-            .ToElements()
-        )
+        for el in DB.FilteredElementCollector(link_doc)\
+                .OfClass(DB.Opening)\
+                .WhereElementIsNotElementType()\
+                .ToElements():
+            results.append(el)
     except Exception:
-        return []
+        pass
+    # IFC / облегчённая геометрия
+    try:
+        for el in DB.FilteredElementCollector(link_doc)\
+                .OfClass(DB.DirectShape)\
+                .WhereElementIsNotElementType()\
+                .ToElements():
+            results.append(el)
+    except Exception:
+        pass
+    # Семейства категории Generic Model
+    try:
+        for el in DB.FilteredElementCollector(link_doc)\
+                .OfCategory(DB.BuiltInCategory.OST_GenericModel)\
+                .WhereElementIsNotElementType()\
+                .ToElements():
+            results.append(el)
+    except Exception:
+        pass
+    return results
 
 
 # =============================================
