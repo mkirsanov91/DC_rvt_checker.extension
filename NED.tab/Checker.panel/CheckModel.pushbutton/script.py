@@ -1060,19 +1060,15 @@ class ResultsNavigatorForm(Form):
             thickness = '{} mm'.format(int(r['thickness_mm'])) if r['thickness_mm'] > 0 else '-'
             elev      = '{} mm'.format(r['elevation_mm']) if r['elevation_mm'] != 0 else '-'
             mep_id    = str(r['mep_id']) if r['mep_id'] != 0 else '-'
-            self._grid.Rows.Add([
-                r['status'],
-                r['level'],
-                r['mep_system'],
-                r['mep_type'],
-                r['struct_type'],
-                'Yes' if r['is_concrete'] else 'No',
-                thickness,
-                r['opening_size'],
-                elev,
-                mep_id,
-                str(r['struct_id']),
-            ])
+            vals = [
+                r['status'], r['level'], r['mep_system'], r['mep_type'],
+                r['struct_type'], 'Yes' if r['is_concrete'] else 'No',
+                thickness, r['opening_size'], elev, mep_id, str(r['struct_id']),
+            ]
+            row_idx = self._grid.Rows.Add()
+            row = self._grid.Rows[row_idx]
+            for ci, v in enumerate(vals):
+                row.Cells[ci].Value = v
         self._grid.ResumeLayout()
 
         totals = {}
