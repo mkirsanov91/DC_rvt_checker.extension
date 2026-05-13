@@ -990,9 +990,32 @@ class ResultsNavigatorForm(Form):
         self.selected_mep = selected_mep
         self.filtered = list(results)
         self.target_view_id = None
-        # Сохраняем ссылки на doc/uidoc — они нужны после завершения скрипта
+
+        # После завершения pyRevit скрипта модульный namespace уничтожается.
+        # Сохраняем все нужные значения как instance variables заранее.
+        from System.Drawing import Color as _C
         self._doc   = doc
         self._uidoc = revit.uidoc
+        self._navigate_fn       = navigate_to_result
+        self._VIEW_NAME         = VIEW_NAME
+        self._S_NO_OPENING      = STATUS_NO_OPENING
+        self._S_OK              = STATUS_OK
+        self._S_UNDERSIZED      = STATUS_UNDERSIZED
+        self._S_EMPTY           = STATUS_EMPTY
+        self._all_statuses      = [STATUS_NO_OPENING, STATUS_OK,
+                                    STATUS_UNDERSIZED, STATUS_EMPTY]
+        self._status_colors = {
+            STATUS_NO_OPENING: (_C.FromArgb(255, 80, 80),  _C.White),
+            STATUS_OK:         (_C.FromArgb(120, 195, 60), _C.Black),
+            STATUS_UNDERSIZED: (_C.FromArgb(255, 140, 0),  _C.White),
+            STATUS_EMPTY:      (_C.FromArgb(255, 230, 0),  _C.Black),
+        }
+        self._c_red    = _C.FromArgb(220, 50, 50)
+        self._c_orange = _C.FromArgb(255, 140, 0)
+        self._c_yellow = _C.FromArgb(255, 230, 0)
+        self._c_white  = _C.White
+        self._c_black  = _C.Black
+
         self._init_ui()
         self._rebuild_grid()
 
@@ -1193,13 +1216,13 @@ class ResultsNavigatorForm(Form):
         self._grid.ResumeLayout()
 
         totals = {}
-        for _st in [STATUS_NO_OPENING, STATUS_OK, STATUS_UNDERSIZED, STATUS_EMPTY]:
+        for _st in self._all_statuses:
             totals[_st] = len([r for r in self.all_results if r['status'] == _st])
         self._lbl_count.Text = (
             'Showing {} / {}  |  No Opening: {}  OK: {}  Undersized: {}  Empty: {}'.format(
                 len(data), len(self.all_results),
-                totals[STATUS_NO_OPENING], totals[STATUS_OK],
-                totals[STATUS_UNDERSIZED], totals[STATUS_EMPTY]
+                totals[self._S_NO_OPENING], totals[self._S_OK],
+                totals[self._S_UNDERSIZED], totals[self._S_EMPTY]
             )
         )
 
@@ -1213,7 +1236,7 @@ class ResultsNavigatorForm(Form):
 
         # Status column
         if e.ColumnIndex == 0:
-            colors = _STATUS_COLORS.get(r['status'])
+            colors = self._status_colors.get(r['status'])
             if colors:
                 e.CellStyle.BackColor = colors[0]
                 e.CellStyle.ForeColor = colors[1]
@@ -1222,14 +1245,14 @@ class ResultsNavigatorForm(Form):
         if e.ColumnIndex == 6 and r['thickness_mm'] > 0:
             t = r['thickness_mm']
             if t >= 400:
-                e.CellStyle.BackColor = Color.FromArgb(220, 50, 50)
-                e.CellStyle.ForeColor = Color.White
+                e.CellStyle.BackColor = self._c_red
+                e.CellStyle.ForeColor = self._c_white
             elif t >= 200:
-                e.CellStyle.BackColor = Color.FromArgb(255, 140, 0)
-                e.CellStyle.ForeColor = Color.White
+                e.CellStyle.BackColor = self._c_orange
+                e.CellStyle.ForeColor = self._c_white
             else:
-                e.CellStyle.BackColor = Color.FromArgb(255, 230, 0)
-                e.CellStyle.ForeColor = Color.Black
+                e.CellStyle.BackColor = self._c_yellow
+                e.CellStyle.ForeColor = self._c_black
 
     # ------------------------------------------------------------------
     # Double-click → navigate
@@ -1239,13 +1262,14 @@ class ResultsNavigatorForm(Form):
             return
         r = self.filtered[e.RowIndex]
         try:
-            vid = navigate_to_result(
+            vid = self._navigate_fn(
                 r, self.selected_structural, self.selected_mep,
                 self._doc, self._uidoc
             )
             if vid is not None:
                 self.target_view_id = vid
-                self._lbl_nav.Text = u'✓ Navigated to element (MEP ID: {})'.format(r['mep_id'])
+                self._lbl_nav.Text = u'✓ {} | MEP ID: {}'.format(
+                    self._VIEW_NAME, r['mep_id'])
             else:
                 self._lbl_nav.Text = 'Could not locate elements.'
         except Exception as ex:
