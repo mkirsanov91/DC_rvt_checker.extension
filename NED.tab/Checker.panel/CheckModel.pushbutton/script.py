@@ -954,7 +954,8 @@ class ResultsNavigatorForm(Form):
         toolbar.Dock = DockStyle.Top
         toolbar.Height = 86
         toolbar.BackColor = Color.FromArgb(245, 247, 250)
-        self.Controls.Add(toolbar)
+        # НЕ добавляем toolbar в Controls здесь — он добавится после grid
+        # (WinForms docking: последний добавленный обрабатывается первым)
 
         x = 10
         def lbl(text, tx, ty):
@@ -1061,7 +1062,10 @@ class ResultsNavigatorForm(Form):
         self._grid.RowHeadersVisible = False
         self._grid.CellFormatting += self._on_cell_format
         self._grid.CellDoubleClick += self._on_dbl_click
+        # Grid добавляется первым — заполнит оставшееся пространство после toolbar
         self.Controls.Add(self._grid)
+        # Toolbar добавляется последним — обрабатывается первым, занимает верх
+        self.Controls.Add(toolbar)
 
         col_defs = [
             ('Status',        110),
