@@ -37,7 +37,7 @@ CONCRETE_KW = [
 ]
 
 # Коды дисциплин на позиции [2] в имени файла: S-HA-[КОД]-[КОМПАНИЯ]-[ЛОКАЦИЯ]-RVT2X
-STRUCTURAL_FILE_CODES = ['AR', 'S', 'ST', 'O', 'OP']
+STRUCTURAL_FILE_CODES = ['AR', 'S', 'ST', 'STR', 'O', 'OP']
 MEP_FILE_CODES        = ['H', 'P', 'E', 'F', 'T', 'HV', 'PL', 'EL', 'FL']
 SKIP_FILE_CODES       = ['TR', 'SI', 'CO', 'CR', 'G', 'Z', 'B', 'FU', 'ID']
 
