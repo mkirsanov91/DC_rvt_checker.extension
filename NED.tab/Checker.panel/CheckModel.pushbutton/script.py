@@ -51,20 +51,32 @@ STATUS_EMPTY      = 'Empty'
 # LINK CLASSIFICATION
 # =============================================
 def classify_link(link_name):
-    """Определяет тип модели по коду дисциплины на позиции [2] имени файла."""
+    """Определяет тип модели по коду дисциплины в имени файла.
+
+    Основной формат: S-HA-[КОД]-... → код на позиции [2].
+    Альтернативный: SHA-OP-... → код на позиции [1] (сводная модель отверстий).
+    """
     parts = link_name.replace('.rvt', '').replace('.RVT', '').split('-')
-    if len(parts) >= 3:
-        d = parts[2].upper()
-        if d in [c.upper() for c in SKIP_FILE_CODES]:       return 'skip'
-        if d in [c.upper() for c in STRUCTURAL_FILE_CODES]: return 'structural'
-        if d in [c.upper() for c in MEP_FILE_CODES]:        return 'mep'
-    # Запасной путь для нестандартных имён
+
+    SKIP_UP       = [c.upper() for c in SKIP_FILE_CODES]
+    STRUCTURAL_UP = [c.upper() for c in STRUCTURAL_FILE_CODES]
+    MEP_UP        = [c.upper() for c in MEP_FILE_CODES]
+
+    # Проверяем позиции [2] и [1] (для моделей с укороченным префиксом типа SHA-OP-...)
+    for idx in [2, 1]:
+        if len(parts) > idx:
+            d = parts[idx].upper()
+            if d in SKIP_UP:       return 'skip'
+            if d in STRUCTURAL_UP: return 'structural'
+            if d in MEP_UP:        return 'mep'
+
+    # Запасной путь: сканируем все части
     for part in parts:
-        if part.upper() in [c.upper() for c in SKIP_FILE_CODES]:       return 'skip'
+        if part.upper() in SKIP_UP:       return 'skip'
     for part in parts:
-        if part.upper() in [c.upper() for c in MEP_FILE_CODES]:        return 'mep'
+        if part.upper() in MEP_UP:        return 'mep'
     for part in parts:
-        if part.upper() in [c.upper() for c in STRUCTURAL_FILE_CODES]: return 'structural'
+        if part.upper() in STRUCTURAL_UP: return 'structural'
     return 'unknown'
 
 
@@ -410,14 +422,20 @@ def run_check(selected_structural, selected_mep, gap_mm, output):
                 found_op    = None
                 found_ob    = None
 
-                for op, ob_host, _doc in openings_host:
+                for op, ob_host, op_doc in openings_host:
                     if not bboxes_intersect(mep_bb, ob_host):
                         continue
-                    # Отверстие должно принадлежать данному конструктивному элементу
+                    # Отверстие должно пересекаться и с конструктивным элементом
+                    if not bboxes_intersect(ob_host, se['bb']):
+                        continue
+                    # Если отверстие из того же линка что и конструктив —
+                    # проверяем что оно принадлежит именно этой стене/перекрытию.
+                    # Если из отдельной модели отверстий — разрешаем без host-проверки.
                     try:
-                        host = op.Host
-                        if host and host.Id != se['elem'].Id:
-                            continue
+                        if op_doc is se['link_doc']:
+                            host = op.Host
+                            if host and host.Id != se['elem'].Id:
+                                continue
                     except Exception:
                         pass
                     found_op = op
