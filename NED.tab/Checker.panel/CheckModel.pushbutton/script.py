@@ -5,6 +5,7 @@ __author__ = 'NED DC'
 
 import clr
 import os
+import datetime
 clr.AddReference('System.Windows.Forms')
 clr.AddReference('System.Drawing')
 
@@ -773,6 +774,140 @@ class ModelSelectionDialog(Form):
 
 
 # =============================================
+# STEP 5 — EXCEL EXPORT
+# =============================================
+def export_to_excel(results, export_folder, gap_mm):
+    """Экспортирует результаты в xlsx файл по формату ТЗ."""
+    try:
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font as XLFont, Alignment
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return None, 'openpyxl is not available in this pyRevit installation'
+
+    if not os.path.exists(export_folder):
+        try:
+            os.makedirs(export_folder)
+        except Exception as e:
+            return None, 'Cannot create folder: {}'.format(e)
+
+    now = datetime.datetime.now()
+    filename = 'NED_OpeningCheck_{}.xlsx'.format(now.strftime('%Y-%m-%d_%H-%M'))
+    filepath = os.path.join(export_folder, filename)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Opening Check Report'
+
+    # Стили
+    HDR_FONT  = XLFont(bold=True, color='FFFFFF', name='Calibri', size=10)
+    HDR_FILL  = PatternFill(start_color='1E5AA0', end_color='1E5AA0', fill_type='solid')
+    HDR_ALIGN = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    DATA_ALIGN = Alignment(vertical='center', wrap_text=False)
+
+    # Заливки по статусу
+    FILL_NO_OPENING = PatternFill(start_color='FF4444', end_color='FF4444', fill_type='solid')
+    FILL_OK         = PatternFill(start_color='92D050', end_color='92D050', fill_type='solid')
+    FILL_UNDERSIZED = PatternFill(start_color='FF8C00', end_color='FF8C00', fill_type='solid')
+    FILL_EMPTY      = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+    STATUS_FILLS = {
+        STATUS_NO_OPENING: FILL_NO_OPENING,
+        STATUS_OK:         FILL_OK,
+        STATUS_UNDERSIZED: FILL_UNDERSIZED,
+        STATUS_EMPTY:      FILL_EMPTY,
+    }
+
+    # Заливки по толщине
+    FILL_RED    = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
+    FILL_ORANGE = PatternFill(start_color='FF8C00', end_color='FF8C00', fill_type='solid')
+    FILL_YELLOW = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+
+    # Заголовки и ширины колонок
+    columns = [
+        ('Status',                   14),
+        ('Level',                    12),
+        ('MEP System',               30),
+        ('Element Type',             16),
+        ('MEP Element ID',           16),
+        ('Structure Type',           14),
+        ('Is Concrete',              12),
+        ('Wall/Floor Type',          28),
+        ('Thickness (mm)',           14),
+        ('Opening Size',             16),
+        ('Elevation from Level (mm)', 24),
+        ('Structure Element ID',     20),
+        ('Approval Status',          16),
+        ('Approval Date',            14),
+        ('Comment',                  30),
+    ]
+
+    for col_idx, (header, width) in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font  = HDR_FONT
+        cell.fill  = HDR_FILL
+        cell.alignment = HDR_ALIGN
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    ws.row_dimensions[1].height = 32
+
+    # Данные
+    for row_idx, r in enumerate(results, 2):
+        thickness = int(round(r['thickness_mm'])) if r['thickness_mm'] > 0 else 0
+        mep_id    = r['mep_id']   if r['mep_id']   != 0 else ''
+        elev      = r['elevation_mm'] if r['elevation_mm'] != 0 else ''
+
+        row_values = [
+            r['status'],
+            r['level'],
+            r['mep_system'],
+            r['mep_type'],
+            mep_id,
+            r['struct_type'],
+            'Yes' if r['is_concrete'] else 'No',
+            r['type_name'],
+            thickness,
+            r['opening_size'],
+            elev,
+            r['struct_id'],
+            '',   # Approval Status — заполняется на Шаге 3
+            '',   # Approval Date   — заполняется на Шаге 3
+            '',   # Comment         — заполняется на Шаге 3
+        ]
+
+        for col_idx, value in enumerate(row_values, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = DATA_ALIGN
+
+        # Цвет ячейки Status (колонка 1)
+        status_fill = STATUS_FILLS.get(r['status'])
+        if status_fill:
+            ws.cell(row=row_idx, column=1).fill = status_fill
+
+        # Цвет ячейки Thickness (колонка 9) по значению толщины
+        t_cell = ws.cell(row=row_idx, column=9)
+        if thickness >= 400:
+            t_cell.fill = FILL_RED
+        elif thickness >= 200:
+            t_cell.fill = FILL_ORANGE
+        elif thickness > 0:
+            t_cell.fill = FILL_YELLOW
+
+    # Автофильтр на весь диапазон данных
+    ws.auto_filter.ref = 'A1:{}{}'.format(
+        get_column_letter(len(columns)), len(results) + 1
+    )
+
+    # Заморозка строки заголовков
+    ws.freeze_panes = 'A2'
+
+    try:
+        wb.save(filepath)
+        return filepath, None
+    except Exception as e:
+        return None, str(e)
+
+
+# =============================================
 # ENTRY POINT
 # =============================================
 def main():
@@ -807,6 +942,39 @@ def main():
 
     output.print_md('---')
     print_results(results, output, dlg.gap_mm)
+
+    # Шаг 5: экспорт в Excel
+    if not results:
+        return
+
+    export_folder = dlg.export_path
+    if not export_folder:
+        # Папка не указана — предлагаем выбрать сейчас
+        from System.Windows.Forms import FolderBrowserDialog
+        fb = FolderBrowserDialog()
+        fb.Description = 'Select folder to save Excel report'
+        from System.Windows.Forms import DialogResult as DR
+        if fb.ShowDialog() == DR.OK:
+            export_folder = fb.SelectedPath
+            save_export_path(export_folder)
+        else:
+            output.print_md('*Excel export skipped — no folder selected.*')
+            return
+
+    output.print_md('---')
+    output.print_md('**Saving Excel report...**')
+    filepath, err = export_to_excel(results, export_folder, dlg.gap_mm)
+
+    if err:
+        output.print_md('**Export error:** {}'.format(err))
+    else:
+        output.print_md('**Report saved:** `{}`'.format(filepath))
+        # Открываем файл автоматически
+        try:
+            import System.Diagnostics
+            System.Diagnostics.Process.Start(filepath)
+        except Exception:
+            pass
 
 
 main()
