@@ -1262,10 +1262,7 @@ class ResultsNavigatorForm(Form):
             return
         r = self.filtered[e.RowIndex]
         try:
-            vid = self._navigate_fn(
-                r, self.selected_structural, self.selected_mep,
-                self._doc, self._uidoc
-            )
+            vid = self._do_navigate(r)
             if vid is not None:
                 self.target_view_id = vid
                 self._lbl_nav.Text = u'✓ {} | MEP ID: {}'.format(
@@ -1274,6 +1271,201 @@ class ResultsNavigatorForm(Form):
                 self._lbl_nav.Text = 'Could not locate elements.'
         except Exception as ex:
             self._lbl_nav.Text = 'Error: {}'.format(ex)
+
+    def _do_navigate(self, result):
+        """Самодостаточный метод навигации — не зависит от module globals.
+
+        Все Revit API типы импортируются локально, чтобы работать
+        после завершения pyRevit скрипта.
+        """
+        import clr
+        clr.AddReference('RevitAPI')
+        from Autodesk.Revit import DB as _DB
+        from System.Collections.Generic import List as CList
+
+        FT_MM = 304.8
+
+        def xform_bb(bbox, transform):
+            corners = [
+                _DB.XYZ(x, y, z)
+                for x in [bbox.Min.X, bbox.Max.X]
+                for y in [bbox.Min.Y, bbox.Max.Y]
+                for z in [bbox.Min.Z, bbox.Max.Z]
+            ]
+            pts = [transform.OfPoint(c) for c in corners]
+            r = _DB.BoundingBoxXYZ()
+            r.Min = _DB.XYZ(min(p.X for p in pts), min(p.Y for p in pts), min(p.Z for p in pts))
+            r.Max = _DB.XYZ(max(p.X for p in pts), max(p.Y for p in pts), max(p.Z for p in pts))
+            return r
+
+        bboxes = []
+        mep_link_inst = None
+
+        if result['mep_id'] != 0:
+            for m_link in self.selected_mep:
+                lnk = m_link['instance'].GetLinkDocument()
+                if not lnk:
+                    continue
+                try:
+                    el = lnk.GetElement(_DB.ElementId(result['mep_id']))
+                    if el:
+                        bb = el.get_BoundingBox(None)
+                        if bb:
+                            bboxes.append(xform_bb(bb, m_link['instance'].GetTotalTransform()))
+                        mep_link_inst = m_link['instance']
+                except Exception:
+                    pass
+                break
+
+        for s_link in self.selected_structural:
+            lnk = s_link['instance'].GetLinkDocument()
+            if not lnk:
+                continue
+            try:
+                el = lnk.GetElement(_DB.ElementId(result['struct_id']))
+                if el:
+                    bb = el.get_BoundingBox(None)
+                    if bb:
+                        bboxes.append(xform_bb(bb, s_link['instance'].GetTotalTransform()))
+            except Exception:
+                pass
+            break
+
+        if not bboxes:
+            return None
+
+        offset = 1000.0 / FT_MM
+        sec_box = _DB.BoundingBoxXYZ()
+        sec_box.Min = _DB.XYZ(
+            min(b.Min.X for b in bboxes) - offset,
+            min(b.Min.Y for b in bboxes) - offset,
+            min(b.Min.Z for b in bboxes) - offset,
+        )
+        sec_box.Max = _DB.XYZ(
+            max(b.Max.X for b in bboxes) + offset,
+            max(b.Max.Y for b in bboxes) + offset,
+            max(b.Max.Z for b in bboxes) + offset,
+        )
+
+        # Solid fill pattern
+        solid_id = None
+        for fp in _DB.FilteredElementCollector(self._doc)\
+                .OfClass(_DB.FillPatternElement).ToElements():
+            try:
+                if fp.GetFillPattern().IsSolidFill:
+                    solid_id = fp.Id
+                    break
+            except Exception:
+                pass
+
+        def make_ogs(r, g, b, transp):
+            ogs = _DB.OverrideGraphicSettings()
+            col = _DB.Color(r, g, b)
+            if solid_id:
+                try:
+                    ogs.SetSurfaceForegroundPatternId(solid_id)
+                    ogs.SetSurfaceForegroundPatternColor(col)
+                    ogs.SetCutForegroundPatternId(solid_id)
+                    ogs.SetCutForegroundPatternColor(col)
+                except Exception:
+                    pass
+            try:
+                ogs.SetSurfaceTransparency(transp)
+                ogs.SetProjectionLineColor(col)
+                ogs.SetCutLineColor(col)
+            except Exception:
+                pass
+            return ogs
+
+        mep_ogs    = make_ogs(255,   0, 210,  0)   # маджента
+        hi_ogs     = make_ogs(255, 230,   0,  0)   # жёлтый highlight
+        struct_ogs = make_ogs(150, 150, 150, 65)   # серый прозрачный
+        try:
+            hi_ogs.SetProjectionLineWeight(7)
+            hi_ogs.SetCutLineWeight(7)
+        except Exception:
+            pass
+
+        target_view_id = None
+        view_name = self._VIEW_NAME
+
+        t = _DB.Transaction(self._doc, 'NED: Navigate to opening')
+        try:
+            t.Start()
+
+            view = None
+            for v in _DB.FilteredElementCollector(self._doc)\
+                    .OfClass(_DB.View3D).ToElements():
+                if not v.IsTemplate and v.Name == view_name:
+                    view = v
+                    break
+
+            if view is None:
+                vft = None
+                for vt in _DB.FilteredElementCollector(self._doc)\
+                        .OfClass(_DB.ViewFamilyType).ToElements():
+                    if vt.ViewFamily == _DB.ViewFamily.ThreeDimensional:
+                        vft = vt
+                        break
+                if vft:
+                    view = _DB.View3D.CreateIsometric(self._doc, vft.Id)
+                    view.Name = view_name
+
+            if view:
+                view.SetSectionBox(sec_box)
+
+                for m_link in self.selected_mep:
+                    try:
+                        view.SetElementOverrides(m_link['instance'].Id, mep_ogs)
+                    except Exception:
+                        pass
+                for s_link in self.selected_structural:
+                    try:
+                        view.SetElementOverrides(s_link['instance'].Id, struct_ogs)
+                    except Exception:
+                        pass
+
+                # Per-element highlight жёлтым
+                if result['mep_id'] != 0 and mep_link_inst is not None:
+                    lnk = mep_link_inst.GetLinkDocument()
+                    if lnk:
+                        try:
+                            el = lnk.GetElement(_DB.ElementId(result['mep_id']))
+                            if el:
+                                view.SetLinkElementOverrides(
+                                    mep_link_inst.Id, el.Id, hi_ogs
+                                )
+                        except Exception:
+                            pass
+
+                target_view_id = view.Id
+
+            t.Commit()
+        except Exception:
+            try:
+                t.RollBack()
+            except Exception:
+                pass
+
+        # Выделяем MEP link instance (синий highlight в Properties)
+        if mep_link_inst is not None:
+            try:
+                ids = CList[_DB.ElementId]()
+                ids.Add(mep_link_inst.Id)
+                self._uidoc.Selection.SetElementIds(ids)
+            except Exception:
+                pass
+
+        # Переключаемся на 3D вид
+        if target_view_id is not None:
+            try:
+                v = self._doc.GetElement(target_view_id)
+                if v:
+                    self._uidoc.ActiveView = v
+            except Exception:
+                pass
+
+        return target_view_id
 
 
 # =============================================
