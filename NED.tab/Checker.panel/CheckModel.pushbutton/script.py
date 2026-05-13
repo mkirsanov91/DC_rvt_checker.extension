@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 __title__ = 'Проверка отверстий'
-__doc__ = 'Проверка наличия и размеров отверстий для MEP элементов в конструктивных моделях'
+__doc__ = 'Check presence and size of openings for MEP elements in structural models'
 __author__ = 'NED DC'
 
 import clr
@@ -25,63 +25,41 @@ from pyrevit import revit, DB, script, forms
 
 doc = revit.doc
 
-# Коды дисциплин для классификации моделей
-STRUCTURAL_CODES = ['AR', 'AR-D', 'ST', 'O', 'OP', 'S']
-MEP_CODES        = ['HV', 'PL', 'EL', 'COM', 'FL', 'H', 'P', 'E', 'T', 'F', 'F-LM']
-SKIP_CODES       = ['TR', 'SI', 'CO', 'CR', 'G', 'Z', 'B', 'FU', 'ID', 'L', 'Q', 'W', 'K']
-
-STRUCTURAL_NUMBERS = [100, 150, 200]
-MEP_NUMBERS        = [300, 400, 500, 550]
-SKIP_NUMBERS       = [350, 600]
+# Коды дисциплин на позиции [2] в имени файла: S-HA-[КОД]-[КОМПАНИЯ]-[ЛОКАЦИЯ]-RVT2X
+STRUCTURAL_FILE_CODES = ['AR', 'S', 'ST', 'O', 'OP']
+MEP_FILE_CODES        = ['H', 'P', 'E', 'F', 'T', 'HV', 'PL', 'EL', 'FL']
+SKIP_FILE_CODES       = ['TR', 'SI', 'CO', 'CR', 'G', 'Z', 'B', 'FU', 'ID']
 
 
 def classify_link(link_name):
     """Определяет тип модели по имени файла Revit Link.
 
-    Формат имени: S-HA-[КОД]-[КОМПАНИЯ]-[ЛОКАЦИЯ]-RVT2X
-    Возвращает: 'structural', 'mep' или 'skip'
+    Формат: S-HA-[КОД]-[КОМПАНИЯ]-[ЛОКАЦИЯ]-RVT2X
+    Дисциплинарный код — позиция [2] при разбивке по дефису.
     """
-    name_upper = link_name.upper()
-    parts = link_name.replace('.rvt', '').replace('.RVT', '').split('-')
+    name_clean = link_name.replace('.rvt', '').replace('.RVT', '')
+    parts = name_clean.split('-')
 
-    # Проверяем числовые коды в имени файла
-    for part in parts:
-        try:
-            num = int(part)
-            if num in STRUCTURAL_NUMBERS:
-                return 'structural'
-            if num in MEP_NUMBERS:
-                return 'mep'
-            if num in SKIP_NUMBERS:
-                return 'skip'
-        except ValueError:
-            pass
-
-    # Проверяем буквенные коды (ищем сегменты имени файла)
-    for part in parts:
-        part_clean = part.strip().upper()
-        # Сначала пропускаемые коды
-        if part_clean in [c.upper() for c in SKIP_CODES]:
+    # Основной путь: берём код с позиции [2]
+    if len(parts) >= 3:
+        discipline = parts[2].upper()
+        if discipline in [c.upper() for c in SKIP_FILE_CODES]:
             return 'skip'
-
-    for part in parts:
-        part_clean = part.strip().upper()
-        if part_clean in [c.upper() for c in STRUCTURAL_CODES]:
+        if discipline in [c.upper() for c in STRUCTURAL_FILE_CODES]:
             return 'structural'
-        # Проверяем MEP коды (H, P, E, F — однобуквенные)
-        if part_clean in [c.upper() for c in MEP_CODES]:
+        if discipline in [c.upper() for c in MEP_FILE_CODES]:
             return 'mep'
 
-    # Дополнительная проверка по характерным подстрокам
-    for code in SKIP_CODES:
-        if ('-' + code.upper() + '-') in name_upper:
+    # Запасной путь для нестандартных имён: сканируем все позиции
+    for part in parts:
+        if part.upper() in [c.upper() for c in SKIP_FILE_CODES]:
             return 'skip'
-    for code in STRUCTURAL_CODES:
-        if ('-' + code.upper() + '-') in name_upper:
-            return 'structural'
-    for code in MEP_CODES:
-        if ('-' + code.upper() + '-') in name_upper:
+    for part in parts:
+        if part.upper() in [c.upper() for c in MEP_FILE_CODES]:
             return 'mep'
+    for part in parts:
+        if part.upper() in [c.upper() for c in STRUCTURAL_FILE_CODES]:
+            return 'structural'
 
     return 'unknown'
 
@@ -97,7 +75,6 @@ def get_all_revit_links():
         link_type = doc.GetElement(link_instance.GetTypeId())
         if link_type is None:
             continue
-        # Получаем имя файла без полного пути
         link_name = link_type.get_Parameter(
             DB.BuiltInParameter.ALL_MODEL_TYPE_NAME
         ).AsString()
@@ -115,7 +92,6 @@ def get_all_revit_links():
 
 
 def get_saved_export_path():
-    """Читает сохранённый путь экспорта из pyRevit config."""
     try:
         cfg = script.get_config()
         return cfg.get_option('export_path', '')
@@ -124,7 +100,6 @@ def get_saved_export_path():
 
 
 def save_export_path(path):
-    """Сохраняет путь экспорта в pyRevit config."""
     try:
         cfg = script.get_config()
         cfg.set_option('export_path', path)
@@ -134,7 +109,6 @@ def save_export_path(path):
 
 
 class ModelSelectionDialog(Form):
-    """Диалог выбора конструктивных и MEP моделей для проверки."""
 
     def __init__(self, structural_links, mep_links, unknown_links):
         Form.__init__(self)
@@ -142,7 +116,6 @@ class ModelSelectionDialog(Form):
         self.mep_links = mep_links
         self.unknown_links = unknown_links
 
-        # Результаты выбора
         self.selected_structural = []
         self.selected_mep = []
         self.gap_mm = 50
@@ -150,19 +123,7 @@ class ModelSelectionDialog(Form):
 
         self._init_ui()
 
-    def _make_header(self, text, parent):
-        """Создаёт заголовок секции."""
-        lbl = Label()
-        lbl.Text = text
-        lbl.Font = Font('Segoe UI', 10, FontStyle.Bold)
-        lbl.ForeColor = Color.FromArgb(30, 90, 160)
-        lbl.AutoSize = True
-        lbl.Margin.Bottom = 4
-        parent.Controls.Add(lbl)
-        return lbl
-
     def _make_checkbox(self, text, parent):
-        """Создаёт чекбокс с переданным текстом."""
         cb = CheckBox()
         cb.Text = text
         cb.AutoSize = True
@@ -172,7 +133,7 @@ class ModelSelectionDialog(Form):
         return cb
 
     def _init_ui(self):
-        self.Text = 'NED DC — Проверка отверстий'
+        self.Text = 'NED DC — Opening Checker'
         self.Size = Size(640, 680)
         self.MinimumSize = Size(580, 600)
         self.StartPosition = FormStartPosition.CenterScreen
@@ -181,9 +142,8 @@ class ModelSelectionDialog(Form):
         self.Font = Font('Segoe UI', 9)
         self.BackColor = Color.White
 
-        # --- Заголовок ---
         title = Label()
-        title.Text = 'Проверка отверстий'
+        title.Text = 'Opening Checker'
         title.Font = Font('Segoe UI', 13, FontStyle.Bold)
         title.ForeColor = Color.FromArgb(30, 90, 160)
         title.Location = Point(16, 14)
@@ -191,7 +151,7 @@ class ModelSelectionDialog(Form):
         self.Controls.Add(title)
 
         subtitle = Label()
-        subtitle.Text = 'Выберите модели и настройте параметры проверки'
+        subtitle.Text = 'Select models and configure check parameters'
         subtitle.Font = Font('Segoe UI', 9)
         subtitle.ForeColor = Color.Gray
         subtitle.Location = Point(16, 40)
@@ -200,9 +160,9 @@ class ModelSelectionDialog(Form):
 
         y = 68
 
-        # --- Группа: конструктивные модели ---
+        # --- Structural models ---
         grp_struct = GroupBox()
-        grp_struct.Text = 'Конструктивные модели (АР / КР / Отверстия)'
+        grp_struct.Text = 'Structural models (AR / ST / Openings)'
         grp_struct.Font = Font('Segoe UI', 9, FontStyle.Bold)
         grp_struct.Location = Point(12, y)
         grp_struct.Size = Size(608, 160)
@@ -218,12 +178,10 @@ class ModelSelectionDialog(Form):
         grp_struct.Controls.Add(self._struct_panel)
 
         self._struct_checkboxes = []
-        links_to_show = self.structural_links + [
-            l for l in self.unknown_links
-        ]
+        links_to_show = self.structural_links + self.unknown_links
         if not links_to_show:
             lbl = Label()
-            lbl.Text = 'Конструктивные модели не найдены'
+            lbl.Text = 'No structural models found'
             lbl.ForeColor = Color.Gray
             lbl.AutoSize = True
             self._struct_panel.Controls.Add(lbl)
@@ -236,9 +194,9 @@ class ModelSelectionDialog(Form):
 
         y += 170
 
-        # --- Группа: MEP модели ---
+        # --- MEP models ---
         grp_mep = GroupBox()
-        grp_mep.Text = 'Инженерные модели (MEP)'
+        grp_mep.Text = 'MEP models (HVAC / Plumbing / Electrical / Fuel)'
         grp_mep.Font = Font('Segoe UI', 9, FontStyle.Bold)
         grp_mep.Location = Point(12, y)
         grp_mep.Size = Size(608, 160)
@@ -256,7 +214,7 @@ class ModelSelectionDialog(Form):
         self._mep_checkboxes = []
         if not self.mep_links:
             lbl = Label()
-            lbl.Text = 'MEP модели не найдены'
+            lbl.Text = 'No MEP models found'
             lbl.ForeColor = Color.Gray
             lbl.AutoSize = True
             self._mep_panel.Controls.Add(lbl)
@@ -269,17 +227,16 @@ class ModelSelectionDialog(Form):
 
         y += 170
 
-        # --- Группа: параметры ---
+        # --- Settings ---
         grp_settings = GroupBox()
-        grp_settings.Text = 'Параметры проверки'
+        grp_settings.Text = 'Check settings'
         grp_settings.Font = Font('Segoe UI', 9, FontStyle.Bold)
         grp_settings.Location = Point(12, y)
         grp_settings.Size = Size(608, 110)
         self.Controls.Add(grp_settings)
 
-        # Зазор
         lbl_gap = Label()
-        lbl_gap.Text = 'Минимальный зазор (мм):'
+        lbl_gap.Text = 'Minimum clearance (mm):'
         lbl_gap.Location = Point(10, 26)
         lbl_gap.AutoSize = True
         grp_settings.Controls.Add(lbl_gap)
@@ -291,15 +248,14 @@ class ModelSelectionDialog(Form):
         grp_settings.Controls.Add(self._txt_gap)
 
         lbl_gap_hint = Label()
-        lbl_gap_hint.Text = 'мм с каждой стороны от MEP элемента'
+        lbl_gap_hint.Text = 'mm on each side of MEP element'
         lbl_gap_hint.ForeColor = Color.Gray
         lbl_gap_hint.Location = Point(278, 26)
         lbl_gap_hint.AutoSize = True
         grp_settings.Controls.Add(lbl_gap_hint)
 
-        # Папка экспорта
         lbl_path = Label()
-        lbl_path.Text = 'Папка для Excel отчёта:'
+        lbl_path.Text = 'Excel report folder:'
         lbl_path.Location = Point(10, 60)
         lbl_path.AutoSize = True
         grp_settings.Controls.Add(lbl_path)
@@ -312,7 +268,7 @@ class ModelSelectionDialog(Form):
         grp_settings.Controls.Add(self._txt_path)
 
         btn_browse = Button()
-        btn_browse.Text = 'Обзор...'
+        btn_browse.Text = 'Browse...'
         btn_browse.Location = Point(508, 56)
         btn_browse.Size = Size(80, 25)
         btn_browse.Click += self._on_browse
@@ -320,11 +276,10 @@ class ModelSelectionDialog(Form):
 
         y += 120
 
-        # --- Кнопки ---
         btn_run = Button()
-        btn_run.Text = 'Запустить проверку'
+        btn_run.Text = 'Run check'
         btn_run.Font = Font('Segoe UI', 10, FontStyle.Bold)
-        btn_run.Size = Size(200, 36)
+        btn_run.Size = Size(160, 36)
         btn_run.Location = Point(12, y + 8)
         btn_run.BackColor = Color.FromArgb(30, 90, 160)
         btn_run.ForeColor = Color.White
@@ -333,62 +288,55 @@ class ModelSelectionDialog(Form):
         self.Controls.Add(btn_run)
 
         btn_cancel = Button()
-        btn_cancel.Text = 'Отмена'
+        btn_cancel.Text = 'Cancel'
         btn_cancel.Size = Size(100, 36)
-        btn_cancel.Location = Point(220, y + 8)
+        btn_cancel.Location = Point(180, y + 8)
         btn_cancel.Click += self._on_cancel
         self.Controls.Add(btn_cancel)
 
         self.ClientSize = Size(640, y + 60)
 
     def _on_browse(self, _s, _a):
-        """Открывает диалог выбора папки."""
         dlg = FolderBrowserDialog()
-        dlg.Description = 'Выберите папку для сохранения Excel отчёта'
+        dlg.Description = 'Select folder for Excel report'
         if self.export_path and os.path.exists(self.export_path):
             dlg.SelectedPath = self.export_path
-        result = dlg.ShowDialog()
-        if result == DialogResult.OK:
+        if dlg.ShowDialog() == DialogResult.OK:
             self._txt_path.Text = dlg.SelectedPath
 
-    def _on_run(self, sender, args):
-        """Собирает результаты выбора и закрывает диалог."""
-        # Собираем выбранные конструктивные модели
+    def _on_run(self, _s, _a):
         self.selected_structural = [
             cb.Tag for cb in self._struct_checkboxes if cb.Checked
         ]
-        # Собираем выбранные MEP модели
         self.selected_mep = [
             cb.Tag for cb in self._mep_checkboxes if cb.Checked
         ]
 
         if not self.selected_structural:
             MessageBox.Show(
-                'Выберите хотя бы одну конструктивную модель.',
+                'Please select at least one structural model.',
                 'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning
             )
             return
 
         if not self.selected_mep:
             MessageBox.Show(
-                'Выберите хотя бы одну MEP модель.',
+                'Please select at least one MEP model.',
                 'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning
             )
             return
 
-        # Проверяем зазор
         try:
             self.gap_mm = int(self._txt_gap.Text.strip())
             if self.gap_mm < 0:
                 raise ValueError
         except ValueError:
             MessageBox.Show(
-                'Введите корректное значение зазора (целое число ≥ 0).',
+                'Please enter a valid clearance value (integer >= 0).',
                 'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning
             )
             return
 
-        # Сохраняем путь экспорта
         self.export_path = self._txt_path.Text.strip()
         if self.export_path:
             save_export_path(self.export_path)
@@ -396,54 +344,44 @@ class ModelSelectionDialog(Form):
         self.DialogResult = DialogResult.OK
         self.Close()
 
-    def _on_cancel(self, sender, args):
+    def _on_cancel(self, _s, _a):
         self.DialogResult = DialogResult.Cancel
         self.Close()
 
 
 def main():
-    # Получаем все Revit Links и классифицируем их
     all_links = get_all_revit_links()
 
     if not all_links:
         forms.alert(
-            'В текущем документе нет подключённых Revit Links.\n'
-            'Откройте рабочую модель с подключёнными файлами.',
-            title='NED DC — Проверка отверстий'
+            'No Revit Links found in the current document.\n'
+            'Please open a host model with linked files.',
+            title='NED DC — Opening Checker'
         )
         return
 
     structural_links = [l for l in all_links if l['category'] == 'structural']
     mep_links        = [l for l in all_links if l['category'] == 'mep']
     unknown_links    = [l for l in all_links if l['category'] == 'unknown']
-    # Пропускаемые модели (TR, SI и т.д.) не показываем
 
-    # Показываем диалог выбора
     dlg = ModelSelectionDialog(structural_links, mep_links, unknown_links)
-    result = dlg.ShowDialog()
-
-    if result != DialogResult.OK:
+    if dlg.ShowDialog() != DialogResult.OK:
         return
 
-    # Выводим итог выбора в Output
     output = script.get_output()
-    output.print_md('# NED DC — Проверка отверстий')
-    output.print_md('## Выбранные модели')
-
-    output.print_md('### Конструктивные:')
+    output.print_md('# NED DC — Opening Checker')
+    output.print_md('## Selected models')
+    output.print_md('### Structural:')
     for link in dlg.selected_structural:
         output.print_md('- {}'.format(link['name']))
-
     output.print_md('### MEP:')
     for link in dlg.selected_mep:
         output.print_md('- {}'.format(link['name']))
-
-    output.print_md('**Зазор:** {} мм'.format(dlg.gap_mm))
+    output.print_md('**Clearance:** {} mm'.format(dlg.gap_mm))
     if dlg.export_path:
-        output.print_md('**Папка отчёта:** {}'.format(dlg.export_path))
-
+        output.print_md('**Report folder:** {}'.format(dlg.export_path))
     output.print_md('---')
-    output.print_md('_Шаг 1 завершён. Логика проверки будет реализована на следующем шаге._')
+    output.print_md('_Step 1 complete. Intersection logic will be implemented next._')
 
 
 main()
