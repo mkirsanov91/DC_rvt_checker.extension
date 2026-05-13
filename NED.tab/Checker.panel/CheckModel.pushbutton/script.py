@@ -155,27 +155,18 @@ def get_type_name(elem, link_doc):
 
 
 def is_concrete(elem, link_doc):
-    """Определяет бетонный ли элемент по ключевым словам в типе и материалах."""
+    """Определяет бетонный ли элемент по ключевым словам в имени типа.
+
+    Проверка по слоям материалов намеренно отключена — GetCompoundStructure()
+    на элементах из Revit Link нестабилен и вызывает краш Revit.
+    """
     try:
         t = _get_elem_type(elem, link_doc)
         if t is None:
             return False
-        type_name = t.Name or ''
-        if any(kw in type_name for kw in CONCRETE_KW):
-            return True
-        # Проверяем слои составной структуры
-        get_cs = getattr(t, 'GetCompoundStructure', None)
-        if get_cs:
-            cs = get_cs()
-            if cs:
-                for layer in cs.GetLayers():
-                    if layer.MaterialId != DB.ElementId.InvalidElementId:
-                        mat = link_doc.GetElement(layer.MaterialId)
-                        if mat and any(kw in (mat.Name or '') for kw in CONCRETE_KW):
-                            return True
+        return any(kw in (t.Name or '') for kw in CONCRETE_KW)
     except Exception:
-        pass
-    return False
+        return False
 
 
 def get_thickness_mm(elem, elem_type, link_doc):
@@ -183,16 +174,9 @@ def get_thickness_mm(elem, elem_type, link_doc):
     try:
         if elem_type == 'Wall':
             return ft_to_mm(elem.Width)
-        else:  # Floor
-            t = _get_elem_type(elem, link_doc)
-            if t is not None:
-                get_cs = getattr(t, 'GetCompoundStructure', None)
-                if get_cs:
-                    cs = get_cs()
-                    if cs:
-                        return ft_to_mm(cs.GetWidth())
+        else:  # Floor — используем параметр, не GetCompoundStructure (нестабилен в Links)
             p = elem.get_Parameter(DB.BuiltInParameter.FLOOR_ATTR_THICKNESS_PARAM)
-            if p:
+            if p and p.AsDouble() > 0:
                 return ft_to_mm(p.AsDouble())
     except Exception:
         pass
@@ -265,7 +249,7 @@ def get_cat_name(elem):
 # DATA COLLECTION FROM LINKED DOCUMENTS
 # =============================================
 def diagnose_wall_types(selected_structural, output):
-    """Выводит уникальные имена типов стен и материалов из конструктивных линков."""
+    """Выводит уникальные имена типов стен из конструктивных линков (без слоёв)."""
     output.print_md('## Wall type diagnostics')
     for s_link in selected_structural:
         inst = s_link['instance']
@@ -273,45 +257,21 @@ def diagnose_wall_types(selected_structural, output):
         if link_doc is None:
             continue
         output.print_md('### {}'.format(s_link['name']))
-
-        type_names   = set()
-        mat_names    = set()
-
+        type_names = set()
         walls = DB.FilteredElementCollector(link_doc)\
             .OfClass(DB.Wall)\
             .WhereElementIsNotElementType()\
             .ToElements()
-
         for wall in walls:
             try:
                 wt = getattr(wall, 'WallType', None)
-                if wt is None:
-                    tid = wall.GetTypeId()
-                    if tid and tid.IntegerValue != -1:
-                        wt = link_doc.GetElement(tid)
                 if wt is not None:
                     type_names.add(wt.Name or '(empty)')
-                    # Слои материалов
-                    get_cs = getattr(wt, 'GetCompoundStructure', None)
-                    if get_cs:
-                        cs = get_cs()
-                        if cs:
-                            for layer in cs.GetLayers():
-                                if layer.MaterialId != DB.ElementId.InvalidElementId:
-                                    mat = link_doc.GetElement(layer.MaterialId)
-                                    if mat:
-                                        mat_names.add(mat.Name or '(empty)')
             except Exception:
                 continue
-
         output.print_md('**Wall types ({} unique):**'.format(len(type_names)))
         for n in sorted(type_names):
             output.print_md('- `{}`'.format(n))
-
-        output.print_md('**Materials in layers ({} unique):**'.format(len(mat_names)))
-        for n in sorted(mat_names):
-            output.print_md('- `{}`'.format(n))
-
     output.print_md('---')
 
 
@@ -792,10 +752,17 @@ class ModelSelectionDialog(Form):
         btn_run.Click += self._on_run
         self.Controls.Add(btn_run)
 
+        btn_diag = Button()
+        btn_diag.Text = 'Diagnose types'
+        btn_diag.Size = Size(130, 36)
+        btn_diag.Location = Point(180, y + 8)
+        btn_diag.Click += self._on_diagnose
+        self.Controls.Add(btn_diag)
+
         btn_cancel = Button()
         btn_cancel.Text = 'Cancel'
         btn_cancel.Size = Size(100, 36)
-        btn_cancel.Location = Point(180, y + 8)
+        btn_cancel.Location = Point(318, y + 8)
         btn_cancel.Click += self._on_cancel
         self.Controls.Add(btn_cancel)
 
@@ -835,6 +802,17 @@ class ModelSelectionDialog(Form):
             save_export_path(self.export_path)
 
         self.DialogResult = DialogResult.OK
+        self.Close()
+
+    def _on_diagnose(self, _s, _a):
+        """Запускает диагностику типов стен без проведения полной проверки."""
+        struct_links = [cb.Tag for cb in self._struct_checkboxes if cb.Checked]
+        if not struct_links:
+            MessageBox.Show('Please select at least one structural model.',
+                            'NED DC', MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            return
+        self.selected_structural = struct_links
+        self.DialogResult = DialogResult.Retry   # используем Retry как сигнал диагностики
         self.Close()
 
     def _on_cancel(self, _s, _a):
@@ -999,20 +977,24 @@ def main():
     unknown_links    = [l for l in all_links if l['category'] == 'unknown']
 
     dlg = ModelSelectionDialog(structural_links, mep_links, unknown_links)
-    if dlg.ShowDialog() != DialogResult.OK:
+    result = dlg.ShowDialog()
+
+    if result == DialogResult.Cancel:
         return
 
     output = script.get_output()
     output.print_md('# NED DC — Opening Checker')
+
+    # Режим диагностики: только вывод типов стен, без полной проверки
+    if result == DialogResult.Retry:
+        diagnose_wall_types(dlg.selected_structural, output)
+        return
     output.print_md('**Structural:** {}'.format(
         ', '.join(l['name'] for l in dlg.selected_structural)))
     output.print_md('**MEP:** {}'.format(
         ', '.join(l['name'] for l in dlg.selected_mep)))
     output.print_md('**Clearance:** {} mm'.format(dlg.gap_mm))
     output.print_md('---')
-
-    # Диагностика типов стен (временно — поможет настроить ключевые слова бетона)
-    diagnose_wall_types(dlg.selected_structural, output)
 
     # Шаг 2: проверка пересечений
     results = run_check(dlg.selected_structural, dlg.selected_mep, dlg.gap_mm, output)
