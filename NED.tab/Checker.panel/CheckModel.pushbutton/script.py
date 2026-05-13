@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__ = 'Проверка отверстий'
+__title__ = 'Opening\nChecker'
 __doc__ = 'Check presence and size of openings for MEP elements in structural models'
 __author__ = 'NED DC'
 
