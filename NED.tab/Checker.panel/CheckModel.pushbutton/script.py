@@ -777,13 +777,11 @@ class ModelSelectionDialog(Form):
 # STEP 5 — EXCEL EXPORT
 # =============================================
 def export_to_excel(results, export_folder, gap_mm):
-    """Экспортирует результаты в xlsx файл по формату ТЗ."""
+    """Экспортирует результаты в xlsx файл по формату ТЗ (через xlsxwriter)."""
     try:
-        import openpyxl
-        from openpyxl.styles import PatternFill, Font as XLFont, Alignment
-        from openpyxl.utils import get_column_letter
+        import xlsxwriter
     except ImportError:
-        return None, 'openpyxl is not available in this pyRevit installation'
+        return None, 'xlsxwriter is not available in this pyRevit installation'
 
     if not os.path.exists(export_folder):
         try:
@@ -795,65 +793,67 @@ def export_to_excel(results, export_folder, gap_mm):
     filename = 'NED_OpeningCheck_{}.xlsx'.format(now.strftime('%Y-%m-%d_%H-%M'))
     filepath = os.path.join(export_folder, filename)
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = 'Opening Check Report'
+    try:
+        wb = xlsxwriter.Workbook(filepath)
+    except Exception as e:
+        return None, str(e)
 
-    # Стили
-    HDR_FONT  = XLFont(bold=True, color='FFFFFF', name='Calibri', size=10)
-    HDR_FILL  = PatternFill(start_color='1E5AA0', end_color='1E5AA0', fill_type='solid')
-    HDR_ALIGN = Alignment(horizontal='center', vertical='center', wrap_text=True)
-    DATA_ALIGN = Alignment(vertical='center', wrap_text=False)
+    ws = wb.add_worksheet('Opening Check Report')
 
-    # Заливки по статусу
-    FILL_NO_OPENING = PatternFill(start_color='FF4444', end_color='FF4444', fill_type='solid')
-    FILL_OK         = PatternFill(start_color='92D050', end_color='92D050', fill_type='solid')
-    FILL_UNDERSIZED = PatternFill(start_color='FF8C00', end_color='FF8C00', fill_type='solid')
-    FILL_EMPTY      = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
-    STATUS_FILLS = {
-        STATUS_NO_OPENING: FILL_NO_OPENING,
-        STATUS_OK:         FILL_OK,
-        STATUS_UNDERSIZED: FILL_UNDERSIZED,
-        STATUS_EMPTY:      FILL_EMPTY,
+    # --- Форматы ---
+    BASE = {'valign': 'vcenter', 'border': 1, 'font_name': 'Calibri', 'font_size': 10}
+
+    def fmt(extra):
+        d = dict(BASE)
+        d.update(extra)
+        return wb.add_format(d)
+
+    hdr_fmt = fmt({'bold': True, 'font_color': 'white', 'bg_color': '#1E5AA0',
+                   'align': 'center', 'text_wrap': True})
+    data_fmt = fmt({})
+
+    # Форматы статусов (колонка Status)
+    STATUS_FMTS = {
+        STATUS_NO_OPENING: fmt({'bg_color': '#FF4444'}),
+        STATUS_OK:         fmt({'bg_color': '#92D050'}),
+        STATUS_UNDERSIZED: fmt({'bg_color': '#FF8C00'}),
+        STATUS_EMPTY:      fmt({'bg_color': '#FFFF00'}),
     }
 
-    # Заливки по толщине
-    FILL_RED    = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
-    FILL_ORANGE = PatternFill(start_color='FF8C00', end_color='FF8C00', fill_type='solid')
-    FILL_YELLOW = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+    # Форматы толщины (колонка Thickness)
+    thick_red    = fmt({'bg_color': '#FF0000'})
+    thick_orange = fmt({'bg_color': '#FF8C00'})
+    thick_yellow = fmt({'bg_color': '#FFFF00'})
 
-    # Заголовки и ширины колонок
+    # --- Колонки: (заголовок, ширина) ---
     columns = [
-        ('Status',                   14),
-        ('Level',                    12),
-        ('MEP System',               30),
-        ('Element Type',             16),
-        ('MEP Element ID',           16),
-        ('Structure Type',           14),
-        ('Is Concrete',              12),
-        ('Wall/Floor Type',          28),
-        ('Thickness (mm)',           14),
-        ('Opening Size',             16),
+        ('Status',                    14),
+        ('Level',                     12),
+        ('MEP System',                30),
+        ('Element Type',              16),
+        ('MEP Element ID',            16),
+        ('Structure Type',            14),
+        ('Is Concrete',               12),
+        ('Wall/Floor Type',           28),
+        ('Thickness (mm)',            14),
+        ('Opening Size',              16),
         ('Elevation from Level (mm)', 24),
-        ('Structure Element ID',     20),
-        ('Approval Status',          16),
-        ('Approval Date',            14),
-        ('Comment',                  30),
+        ('Structure Element ID',      20),
+        ('Approval Status',           16),
+        ('Approval Date',             14),
+        ('Comment',                   30),
     ]
 
-    for col_idx, (header, width) in enumerate(columns, 1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font  = HDR_FONT
-        cell.fill  = HDR_FILL
-        cell.alignment = HDR_ALIGN
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    # Записываем заголовки (строка 0)
+    for col_idx, (header, width) in enumerate(columns):
+        ws.write(0, col_idx, header, hdr_fmt)
+        ws.set_column(col_idx, col_idx, width)
+    ws.set_row(0, 32)
 
-    ws.row_dimensions[1].height = 32
-
-    # Данные
-    for row_idx, r in enumerate(results, 2):
+    # Записываем данные (строки 1+)
+    for row_idx, r in enumerate(results, 1):
         thickness = int(round(r['thickness_mm'])) if r['thickness_mm'] > 0 else 0
-        mep_id    = r['mep_id']   if r['mep_id']   != 0 else ''
+        mep_id    = r['mep_id']      if r['mep_id']      != 0 else ''
         elev      = r['elevation_mm'] if r['elevation_mm'] != 0 else ''
 
         row_values = [
@@ -869,39 +869,33 @@ def export_to_excel(results, export_folder, gap_mm):
             r['opening_size'],
             elev,
             r['struct_id'],
-            '',   # Approval Status — заполняется на Шаге 3
-            '',   # Approval Date   — заполняется на Шаге 3
-            '',   # Comment         — заполняется на Шаге 3
+            '',   # Approval Status — Step 3
+            '',   # Approval Date   — Step 3
+            '',   # Comment         — Step 3
         ]
 
-        for col_idx, value in enumerate(row_values, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            cell.alignment = DATA_ALIGN
+        for col_idx, value in enumerate(row_values):
+            if col_idx == 0:
+                cell_fmt = STATUS_FMTS.get(r['status'], data_fmt)
+            elif col_idx == 8:
+                if thickness >= 400:
+                    cell_fmt = thick_red
+                elif thickness >= 200:
+                    cell_fmt = thick_orange
+                elif thickness > 0:
+                    cell_fmt = thick_yellow
+                else:
+                    cell_fmt = data_fmt
+            else:
+                cell_fmt = data_fmt
+            ws.write(row_idx, col_idx, value, cell_fmt)
 
-        # Цвет ячейки Status (колонка 1)
-        status_fill = STATUS_FILLS.get(r['status'])
-        if status_fill:
-            ws.cell(row=row_idx, column=1).fill = status_fill
-
-        # Цвет ячейки Thickness (колонка 9) по значению толщины
-        t_cell = ws.cell(row=row_idx, column=9)
-        if thickness >= 400:
-            t_cell.fill = FILL_RED
-        elif thickness >= 200:
-            t_cell.fill = FILL_ORANGE
-        elif thickness > 0:
-            t_cell.fill = FILL_YELLOW
-
-    # Автофильтр на весь диапазон данных
-    ws.auto_filter.ref = 'A1:{}{}'.format(
-        get_column_letter(len(columns)), len(results) + 1
-    )
-
-    # Заморозка строки заголовков
-    ws.freeze_panes = 'A2'
+    # Автофильтр и заморозка заголовка
+    ws.autofilter(0, 0, len(results), len(columns) - 1)
+    ws.freeze_panes(1, 0)
 
     try:
-        wb.save(filepath)
+        wb.close()
         return filepath, None
     except Exception as e:
         return None, str(e)
