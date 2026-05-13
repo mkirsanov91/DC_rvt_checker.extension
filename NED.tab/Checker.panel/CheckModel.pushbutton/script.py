@@ -126,10 +126,28 @@ def get_level_name(elem, link_doc):
     return 'Unknown'
 
 
+def _get_elem_type(elem, link_doc):
+    """Возвращает объект типа элемента несколькими способами."""
+    # Wall — прямое свойство, не требует поиска в документе
+    wt = getattr(elem, 'WallType', None)
+    if wt is not None:
+        return wt
+    # Floor и прочие — через GetTypeId()
+    try:
+        tid = elem.GetTypeId()
+        if tid and tid.IntegerValue != -1:
+            t = link_doc.GetElement(tid)
+            if t is not None:
+                return t
+    except Exception:
+        pass
+    return None
+
+
 def get_type_name(elem, link_doc):
     try:
-        t = link_doc.GetElement(elem.GetTypeId())
-        if t:
+        t = _get_elem_type(elem, link_doc)
+        if t is not None:
             return t.Name or 'Unknown'
     except Exception:
         pass
@@ -139,7 +157,7 @@ def get_type_name(elem, link_doc):
 def is_concrete(elem, link_doc):
     """Определяет бетонный ли элемент по ключевым словам в типе и материалах."""
     try:
-        t = link_doc.GetElement(elem.GetTypeId())
+        t = _get_elem_type(elem, link_doc)
         if t is None:
             return False
         type_name = t.Name or ''
@@ -166,8 +184,8 @@ def get_thickness_mm(elem, elem_type, link_doc):
         if elem_type == 'Wall':
             return ft_to_mm(elem.Width)
         else:  # Floor
-            t = link_doc.GetElement(elem.GetTypeId())
-            if t:
+            t = _get_elem_type(elem, link_doc)
+            if t is not None:
                 get_cs = getattr(t, 'GetCompoundStructure', None)
                 if get_cs:
                     cs = get_cs()
